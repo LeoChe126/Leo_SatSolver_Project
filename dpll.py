@@ -9,7 +9,7 @@ import time
 # A literal is a nonzero int: +v means true, -v means false.
 # A clause is a list of literals (a disjunction). A formula is a list of clauses.
  
-def parse_dimacs(text): 
+def parseFile(text): 
     num_vars = 0
     tokens = []
     for line in text.splitlines():
@@ -130,7 +130,7 @@ def verify(clauses, assignment):
 
  
 def solve_text(text):
-    num_vars, clauses = parse_dimacs(text)
+    num_vars, clauses = parseFile(text)
     t0 = time.perf_counter()
     result = dpll([c[:] for c in clauses], {}) #first argument makes a copy of all clauses, second argument is empty assignment at first 
     elapsed = time.perf_counter() - t0
