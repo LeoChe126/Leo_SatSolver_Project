@@ -146,7 +146,7 @@ def solve_text(text):
  
 def main():
     if len(sys.argv) != 2:
-        print(__doc__)
+        print("Usage: python DPLL/dpll.py benchmarks/../xx.cnf")
         return
     with open(sys.argv[1]) as f:
         verdict, model, elapsed, nv, nc = solve_text(f.read())
