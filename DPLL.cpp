@@ -79,7 +79,16 @@ CNF parseFile(const std::string& filename) {
 
 const int MODE = 1;
 
-int main() {
+// Command for running program: ./dpll.exe "[X]", where X is the name of the file location of the dataset.
+int main(int argc, char* argv[]) {
+
+    if(argc == 1){
+        std::cout << "ERROR: File location not provided." << std::endl;
+        return 1;
+    } else {
+        std::cout << "File location " << argv[1] << " used." << std::endl;
+    }
+
     // Generate the header and file count based on the mode
     std::string folderName;
     std::string fileHeader;
@@ -95,8 +104,12 @@ int main() {
             break;
     }
 
+    std::string base = argv[1]; // Gets upset if argv[1] is directly plugged into the line below, likely because argv[1] is not a string but a pointer.
+    base = base + "\\" + folderName + "\\" + fileHeader;
+
     for(int i = 1; i <= fileCount; i++){
-        CNF formula = parseFile(folderName + "/" + fileHeader + std::to_string(i) + ".cnf");
+
+        CNF formula = parseFile(base + std::to_string(i) + ".cnf");
 
         std::cout << "Parsed " << formula.num_variables << " variables and " 
                   << formula.clauses.size() << " clauses." << std::endl;
