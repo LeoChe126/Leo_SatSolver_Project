@@ -253,13 +253,14 @@ CNF parseFile(const std::string& filename) {
 
 /*
  * Mode 1: uf20-91: 20 variables, all satisfiable. 1000 files. Filename format: uf20-0X.cnf, where X is the file number.
- * 
- * 
+ * Mode 2: uf50-218: 50 variables, all satisfiable. 1000 files. Filename format: uf50-0X.cnf, where X is the file number.
+ * Mode 3: uuf50-218: 50 variables, all unsatisfiable. 1000 files. Filename format: uuf50-0X.cnf, where X is the file number.
  */
 
-const int MODE = 1;
+const int MODE = 3;
 
-// Command for running program: ./dpll.exe "[X]", where X is the name of the file location of the dataset.
+// Command for generating dpll.exe: g++ -o dpll DPLL.cpp
+// Command for running program: ./dpll "[X]", where X is the name of the file location of the dataset.
 int main(int argc, char* argv[]) {
 
     if(argc == 1) {
@@ -277,6 +278,16 @@ int main(int argc, char* argv[]) {
         case 1: 
             folderName = "uf20-91";
             fileHeader = "uf20-0";
+            fileCount = 1000;
+            break;
+        case 2:
+            folderName = "uf50-218";
+            fileHeader = "uf50-0";
+            fileCount = 1000;
+            break;
+        case 3:
+            folderName = "uuf50-218";
+            fileHeader = "uuf50-0";
             fileCount = 1000;
             break;
 
