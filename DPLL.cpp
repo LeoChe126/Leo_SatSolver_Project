@@ -7,12 +7,14 @@
 #include <sstream>
 #include <vector>
 #include <string>
+#include <filesystem>
 
 // DPLL algorithm
 #include <chrono>
 #include <unordered_map>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 
 struct CNF {
     int num_variables = 0;
@@ -90,7 +92,7 @@ CNF unitPropagation(CNF formula, std::unordered_map<int,int> &assignments, bool 
  * Output:
  *     Returns the updated CNF
  */
-CNF pureLiteralElimination(CNF formula, std::unordered_map<int,int> &assignments, int &guess, bool &changed) {
+CNF pureLiteralElimination(CNF formula, std::unordered_map<int,int> &assignments, bool &changed) {
     std::vector<int> count;
     for(int i = 0; i < formula.num_clauses; i++) {
         std::vector<int> clause = formula.clauses[i];
@@ -110,7 +112,7 @@ CNF pureLiteralElimination(CNF formula, std::unordered_map<int,int> &assignments
 
         auto check = std::find(count.begin(), count.end(), -var);
         if(check != count.end()) {                          // If the negative polarity is found, sets both the same and negative polarity values to 0 to skip later.
-            guess = var;
+            //guess = var;
             var = 0;
             count[std::distance(count.begin(), check)] = 0;
         } else {                                            // If no negative polarity is found, sets the corresponding variable to positive.
@@ -121,6 +123,18 @@ CNF pureLiteralElimination(CNF formula, std::unordered_map<int,int> &assignments
     }
 
     return formula;
+}
+// Helper function, replace that decision step with a direct scan for the first available nonzero literal. (Align with python implementation)
+int chooseFirstLiteral(const CNF& formula) {
+    for (const auto& clause : formula.clauses) {
+        for (int lit : clause) {
+            if (lit != 0) {
+                return lit;
+            }
+        }
+    }
+
+    return 0; // only happens if no decision literal exists
 }
 
 // Runs DPLL algorithm with the satisifiability of the formula being stored in verdict.
@@ -134,14 +148,15 @@ std::unordered_map<int,int> DPLL(CNF formula, bool &verdict) {
     // Because both needs to be ran at least once before repeating, one iteration is done outside.
     bool changed = false;
     bool exit = false;
-    int guess = 0;
+    //int guess = 0;
 
     formula = unitPropagation(formula, assignments, exit, changed);
     if(exit) {
         verdict = false;
         return assignments;
     }
-    formula = pureLiteralElimination(formula, assignments, guess, changed);
+    //formula = pureLiteralElimination(formula, assignments, guess, changed);
+    formula = pureLiteralElimination(formula, assignments, changed);
 
     while(true){
         if(!changed) break;
@@ -156,7 +171,8 @@ std::unordered_map<int,int> DPLL(CNF formula, bool &verdict) {
         if(!changed) break;
         changed = false;
 
-        formula = pureLiteralElimination(formula, assignments, guess, changed);
+        //formula = pureLiteralElimination(formula, assignments, guess, changed);
+        formula = pureLiteralElimination(formula, assignments, changed);
     }
 
     // Base Cases: Checks to see if all clauses are satisfied or one clause is empty
@@ -180,10 +196,20 @@ std::unordered_map<int,int> DPLL(CNF formula, bool &verdict) {
     }
 
     // Recursion: Selects the first unassigned literal, then tries simplifying with both positive and negative inputs.
-    for(int g : {guess, -guess}) {
+    int lit = chooseFirstLiteral(formula);
+
+    if (lit == 0) {
+        verdict = false;
+        return assignments;
+    }
+
+    for (int g : {lit, -lit}) {
         bool v = false;
-        std::unordered_map<int,int> a = DPLL(simplify(formula, g), v);
-        if(v) {
+
+        CNF simplified = simplify(formula, g);
+        std::unordered_map<int, int> a = DPLL(simplified, v);
+
+        if (v) {
             verdict = true;
             a.insert({std::abs(g), g > 0});
             return a;
@@ -257,64 +283,113 @@ CNF parseFile(const std::string& filename) {
  * Mode 3: uuf50-218: 50 variables, all unsatisfiable. 1000 files. Filename format: uuf50-0X.cnf, where X is the file number.
  */
 
-const int MODE = 3;
+//const int MODE = 2; //Terminal inputs is now used to select the mode, no longer needed. 
 
 // Command for generating dpll.exe: g++ -o dpll DPLL.cpp
 // Command for running program: ./dpll "[X]", where X is the name of the file location of the dataset.
-int main(int argc, char* argv[]) {
-
-    if(argc == 1) {
-        std::cout << "ERROR: File location not provided." << std::endl;
+int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
+    if (argc != 2 && argc != 3) {
+        std::cout << "Usage: ./dpll_cpp <benchmark_folder> [output_csv]" << std::endl;
+        std::cout << "Example: ./dpll_cpp benchmarks/uf50-218 dpll_cpp_uf50_1000.csv" << std::endl;
+        std::cout << "Example: ./dpll_cpp benchmarks/uuf50-218 dpll_cpp_uuf50_1000.csv" << std::endl;
         return 1;
-    } else {
-        std::cout << "File location " << argv[1] << " used." << std::endl;
     }
 
-    // Generate the header and file count based on the mode
-    std::string folderName;
-    std::string fileHeader;
-    int fileCount;
-    switch(MODE) {
-        case 1: 
-            folderName = "uf20-91";
-            fileHeader = "uf20-0";
-            fileCount = 1000;
-            break;
-        case 2:
-            folderName = "uf50-218";
-            fileHeader = "uf50-0";
-            fileCount = 1000;
-            break;
-        case 3:
-            folderName = "uuf50-218";
-            fileHeader = "uuf50-0";
-            fileCount = 1000;
-            break;
+    std::string benchmarkFolder = argv[1];
 
-        default:
-            break;
+    bool writeCSV = (argc == 3);
+    std::ofstream csv;
+
+    if (writeCSV) {
+        csv.open(argv[2]);
+        csv << "file,time,verdict\n";
     }
 
-    std::string base = argv[1]; // Gets upset if argv[1] is directly plugged into the line below, likely because argv[1] is not a string but a pointer.
-    base = base + "\\" + folderName + "\\" + fileHeader;
+    std::vector<std::filesystem::path> files;
 
-    std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
-    for(int i = 0; i < fileCount; i++) {
-        CNF formula = parseFile(base + std::to_string(i + 1) + ".cnf");
-        std::cout << "Parsed file " << (i + 1) << ": Has " << formula.num_variables << " variables and " << formula.clauses.size() << " clauses." << std::endl;
+    for (const auto& entry : std::filesystem::directory_iterator(benchmarkFolder)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".cnf") {
+            files.push_back(entry.path());
+        }
+    }
 
-        start = std::chrono::high_resolution_clock::now();
+    std::sort(files.begin(), files.end());
+
+    if (files.empty()) {
+        std::cout << "ERROR: No .cnf files found in " << benchmarkFolder << std::endl;
+        return 1;
+    }
+
+    int numSolved = 0;
+    int satCount = 0;
+    int unsatCount = 0;
+
+    double minTime = std::numeric_limits<double>::max();
+    double maxTime = 0.0;
+    double totalTime = 0.0;
+
+    for (const auto& filePath : files) {
+        std::string filename = filePath.string();
+
+        CNF formula = parseFile(filename);
+
+        auto start = std::chrono::high_resolution_clock::now();
 
         bool verdict = false;
-        std::unordered_map<int,int> assignments = DPLL(formula, verdict);
+        std::unordered_map<int, int> assignments = DPLL(formula, verdict);
 
-        end = std::chrono::high_resolution_clock::now();
+        auto end = std::chrono::high_resolution_clock::now();
 
-        double duration = (std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000.0;
+        double elapsed_seconds =
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000000.0;
 
-        std::cout << "Verdict: " << verdict << std::endl;
-        std::cout << "Duration: " << duration << "ms" << std::endl;
+        std::string verdictString = verdict ? "SATISFIABLE" : "UNSATISFIABLE";
+
+        numSolved++;
+        totalTime += elapsed_seconds;
+
+        if (elapsed_seconds < minTime) {
+            minTime = elapsed_seconds;
+        }
+
+        if (elapsed_seconds > maxTime) {
+            maxTime = elapsed_seconds;
+        }
+
+        if (verdict) {
+            satCount++;
+        } else {
+            unsatCount++;
+        }
+
+        if (writeCSV) {
+            csv << filename << ","
+                << elapsed_seconds << ","
+                << verdictString << "\n";
+        }
+
+        std::cout << filename << "," << elapsed_seconds << "," << verdictString << std::endl;
     }
-              
+
+    if (writeCSV) {
+        csv.close();
+    }
+
+    double avgTime = totalTime / numSolved;
+
+    std::cout << std::endl;
+    std::cout << "num solved: " << numSolved << std::endl;
+    std::cout << "min time: " << minTime << std::endl;
+    std::cout << "max time: " << maxTime << std::endl;
+    std::cout << "avg time: " << avgTime << std::endl;
+
+    std::cout << std::endl;
+    std::cout << "SAT count: " << satCount << std::endl;
+    std::cout << "UNSAT count: " << unsatCount << std::endl;
+
+    if (writeCSV) {
+        std::cout << "Results written to " << argv[2] << std::endl;
+    }
+
     return 0;
 }
