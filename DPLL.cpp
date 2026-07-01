@@ -62,7 +62,7 @@ CNF simplify(const CNF& formula, int lit) {
  * Output:
  *     Returns the updated CNF
  */
-CNF unitPropagation(CNF formula, std::unordered_map<int,int> &assignments, bool &exit, bool &changed) {
+CNF unitPropagation(CNF formula, std::unordered_map<int,int> &assignments, bool &exit) {
     while(true) {
         int var = 0;
         bool flag = false;
@@ -97,7 +97,7 @@ CNF unitPropagation(CNF formula, std::unordered_map<int,int> &assignments, bool 
         }
 
         formula = simplify(formula, var);
-        changed = true;
+        // changed = true;
     }
 
     return formula;
@@ -112,7 +112,7 @@ CNF unitPropagation(CNF formula, std::unordered_map<int,int> &assignments, bool 
  * Output:
  *     Returns the updated CNF
  */
-CNF pureLiteralElimination(CNF formula, std::unordered_map<int,int> &assignments, bool &changed) {
+CNF pureLiteralElimination(CNF formula, std::unordered_map<int,int> &assignments) {
     std::vector<int> count;
     for(int i = 0; i < formula.clauses.size(); i++) {
         std::vector<int> clause = formula.clauses[i];
@@ -132,13 +132,12 @@ CNF pureLiteralElimination(CNF formula, std::unordered_map<int,int> &assignments
 
         auto check = std::find(count.begin(), count.end(), -var);
         if(check != count.end()) {                          // If the negative polarity is found, sets both the same and negative polarity values to 0 to skip later.
-            //guess = var;
             var = 0;
             count[std::distance(count.begin(), check)] = 0;
         } else {                                            // If no negative polarity is found, sets the corresponding variable to positive.
             assignments.insert({std::abs(var), var > 0});
             formula = simplify(formula, var);
-            changed = true;
+            // changed = true;
         }
     }
 
@@ -158,7 +157,7 @@ int chooseFirstLiteral(const CNF& formula) {    // fix(1): branching logic chang
 }
 
 // Runs DPLL algorithm with the satisifiability of the formula being stored in verdict.
-// Output is an unordred map of variables to values. (Works similarly to a Python dictionary)
+// Output is an unordered map of variables to values. (Works similarly to a Python dictionary)
 // 0 represents negative, 1 represents positive
 std::unordered_map<int,int> DPLL(CNF formula, bool &verdict) {
     // Initialize unordered map and temp CNF (to not modify the original)
@@ -166,34 +165,33 @@ std::unordered_map<int,int> DPLL(CNF formula, bool &verdict) {
 
     // Repeats unit propagation and pure literal elimination until neither change something.
     // Because both needs to be ran at least once before repeating, one iteration is done outside.
-    bool changed = false;
+    // bool changed = false;
     bool exit = false;
-    //int guess = 0;
 
-    formula = unitPropagation(formula, assignments, exit, changed);
+    // formula = unitPropagation(formula, assignments, exit, changed);
+    formula = unitPropagation(formula, assignments, exit);
     if(exit) {
         verdict = false;
         return assignments;
     }
-    //formula = pureLiteralElimination(formula, assignments, guess, changed);
-    formula = pureLiteralElimination(formula, assignments, changed);
+    // formula = pureLiteralElimination(formula, assignments, changed);
+    formula = pureLiteralElimination(formula, assignments);
 
-    while(true){
-        if(!changed) break;
-        changed = false;
+    // while(true){
+    //     if(!changed) break;
+    //     changed = false;
 
-        formula = unitPropagation(formula, assignments, exit, changed);
-        if(exit) {
-            verdict = false;
-            return assignments;
-        }
+    //     formula = unitPropagation(formula, assignments, exit, changed);
+    //     if(exit) {
+    //         verdict = false;
+    //         return assignments;
+    //     }
 
-        if(!changed) break;
-        changed = false;
+    //     if(!changed) break;
+    //     changed = false;
 
-        //formula = pureLiteralElimination(formula, assignments, guess, changed);
-        formula = pureLiteralElimination(formula, assignments, changed);
-    }
+    //     formula = pureLiteralElimination(formula, assignments, changed);
+    // }
 
     // Base Case 1: no clauses left means all clauses were satisfied
     if (formula.clauses.empty()) {
