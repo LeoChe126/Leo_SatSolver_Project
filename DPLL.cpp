@@ -23,21 +23,34 @@ struct CNF {
 };
 
 // Simplifies the CNF when a certain variable is asserted true.
-CNF simplify(CNF formula, int var) {
-    for(int i = 0; i < formula.num_clauses; i++) {
-        for(int j = 0; j < formula.clauses[i].size(); j++) {
-            std::vector<int> &clause = formula.clauses[i];
-            if(clause[j] == var) { // Always satisfied after assertion (represented by {0})
-                clause = {0};
+CNF simplify(const CNF& formula, int lit) {
+    CNF newFormula;                                         // Creates a new CNF to store the simplified formula (fix(2))
+    newFormula.num_variables = formula.num_variables;       // Copies the number of variables from the original formula (fix(2))
+    newFormula.clauses.reserve(formula.clauses.size());     // Reserves space for the new clauses to avoid multiple allocations (fix(2))
+    
+    for (const auto& clause : formula.clauses) {
+        bool satisfied = false;
+        std::vector<int> newClause;
+        newClause.reserve(clause.size());
+
+        for (int x : clause) {
+            if (x == lit) {
+                satisfied = true;
                 break;
-            } else if(clause[j] == -var) { // Removes the variable since it is always false
-                clause.erase(clause.begin() + j);
-                j--;
-            } // Does nothing if it can't find the relevant variable
+            }
+
+            if (x != -lit) {
+                newClause.push_back(x);
+            }
+        }
+
+        if (!satisfied) {
+            newFormula.clauses.push_back(newClause);
         }
     }
 
-    return formula;
+    newFormula.num_clauses = newFormula.clauses.size();
+    return newFormula;
 }
 
 /* Performs unit propagation
@@ -53,28 +66,35 @@ CNF unitPropagation(CNF formula, std::unordered_map<int,int> &assignments, bool 
     while(true) {
         int var = 0;
         bool flag = false;
-        for(int i = 0; i < formula.num_clauses; i++) {
+        for(int i = 0; i < formula.clauses.size(); i++) {
             // Empty clause -> Automatically fails
             if(formula.clauses[i].empty()) {
-                exit = false;
+                exit = true;
                 return formula;
             }
             
             // Unit clause -> Automatically assigned to satisfy equation
             if(formula.clauses[i].size() == 1) {
                 var = formula.clauses[i][0];
+                assignments[std::abs(var)] = (var > 0);
+                flag = true;
+                break;
 
                 // Checks to see if the unit clause is NOT {0} (aka already satisfied)
+                /*
                 if(var != 0){
                     assignments.insert({std::abs(var), var > 0});
                     flag = true;
                     break;
                 }
+                */
             }
         }
 
         // Breaks loop if no more unit clauses are found
-        if(!flag) break;
+        if(!flag) {
+            break;
+        }
 
         formula = simplify(formula, var);
         changed = true;
@@ -94,7 +114,7 @@ CNF unitPropagation(CNF formula, std::unordered_map<int,int> &assignments, bool 
  */
 CNF pureLiteralElimination(CNF formula, std::unordered_map<int,int> &assignments, bool &changed) {
     std::vector<int> count;
-    for(int i = 0; i < formula.num_clauses; i++) {
+    for(int i = 0; i < formula.clauses.size(); i++) {
         std::vector<int> clause = formula.clauses[i];
         for(int j = 0; j < clause.size(); j++) {
             int var = clause[j];
@@ -125,7 +145,7 @@ CNF pureLiteralElimination(CNF formula, std::unordered_map<int,int> &assignments
     return formula;
 }
 // Helper function, replace that decision step with a direct scan for the first available nonzero literal. (Align with python implementation)
-int chooseFirstLiteral(const CNF& formula) {
+int chooseFirstLiteral(const CNF& formula) {    // fix(1): branching logic changed to select the first available literal (align with Python implementation)
     for (const auto& clause : formula.clauses) {
         for (int lit : clause) {
             if (lit != 0) {
@@ -175,25 +195,20 @@ std::unordered_map<int,int> DPLL(CNF formula, bool &verdict) {
         formula = pureLiteralElimination(formula, assignments, changed);
     }
 
-    // Base Cases: Checks to see if all clauses are satisfied or one clause is empty
-    bool complete = true;
-    for(int i = 0; i < formula.num_clauses; i++) {
-        std::vector<int> clause = formula.clauses[i];
-
-        // If a clause is empty, then the code automatically flags this branch as impossible.
-        if(clause.size() == 0) {
-            verdict = false;
-            return assignments;
-        }
-
-        // If the complete flag is on and any clause is not specifically {0} (aka satisfied), then the complete flag is turned off.
-        if(complete && (clause.size() != 1 || clause[0] != 0)) complete = false;
-    }
-
-    if(complete) {
+    // Base Case 1: no clauses left means all clauses were satisfied
+    if (formula.clauses.empty()) {
         verdict = true;
         return assignments;
     }
+
+    // Base Case 2: an empty clause means this branch failed
+    for (const auto& clause : formula.clauses) {
+        if (clause.empty()) {
+            verdict = false;
+            return assignments;
+        }
+    }
+
 
     // Recursion: Selects the first unassigned literal, then tries simplifying with both positive and negative inputs.
     int lit = chooseFirstLiteral(formula);
@@ -234,19 +249,39 @@ CNF parseFile(const std::string& filename) {
     std::vector<int> current_clause;
 
     while (std::getline(infile, line)) {
+        // Trim leading/trailing whitespace
+        size_t start = line.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) {
+            continue;
+        }
+
+        size_t end = line.find_last_not_of(" \t\r\n");
+        line = line.substr(start, end - start + 1);
+
         // Skip empty lines
-        if (line.empty()) continue;
+        if (line.empty()){
+            continue;
+        }
+
+        if (line[0] == 'c') {
+            continue;
+        }
+
+        if (line[0] == '%') {
+            continue;
+        }
+
+        if (line == "0") {
+            continue;
+        }
 
         std::istringstream iss(line);
         char type;
         iss >> type;
 
         // Skip comment lines
-        if (type == 'c') {
-            continue;
-        }
         // Problem line: p cnf [num_vars] [num_clauses]
-        else if (type == 'p') {
+        if (type == 'p') {
             std::string format;
             iss >> format >> formula.num_variables >> formula.num_clauses;
             formula.clauses.reserve(formula.num_clauses); // Optimize memory allocations
@@ -274,14 +309,11 @@ CNF parseFile(const std::string& filename) {
         formula.clauses.push_back(current_clause);
     }
 
+    formula.num_clauses = formula.clauses.size();
+    
     return formula;
 }
 
-/*
- * Mode 1: uf20-91: 20 variables, all satisfiable. 1000 files. Filename format: uf20-0X.cnf, where X is the file number.
- * Mode 2: uf50-218: 50 variables, all satisfiable. 1000 files. Filename format: uf50-0X.cnf, where X is the file number.
- * Mode 3: uuf50-218: 50 variables, all unsatisfiable. 1000 files. Filename format: uuf50-0X.cnf, where X is the file number.
- */
 
 //const int MODE = 2; //Terminal inputs is now used to select the mode, no longer needed. 
 
