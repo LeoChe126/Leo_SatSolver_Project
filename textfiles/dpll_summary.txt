@@ -1,0 +1,32 @@
+Basic DPLL SATLIB Benchmark Summary
+
+Solver:
+- Custom Python DPLL solver
+- DIMACS CNF parser
+- Unit propagation
+- Pure literal elimination
+- Naive first-literal branching heuristic
+- 30 second timeout per instance
+
+SAT benchmark: uf50-218
+- Variables per instance: 50
+- Clauses per instance: 218
+- Instances tested: 1000
+- SATISFIABLE: 1000
+- TIMEOUT: 0
+- Min runtime: 0.0007 s
+- Max runtime: 0.1395 s
+- Average runtime: 0.0196214 s
+
+UNSAT benchmark: uuf50-218
+- Variables per instance: 50
+- Clauses per instance: 218
+- Instances tested: 1000
+- UNSATISFIABLE: 1000
+- TIMEOUT: 0
+- Min runtime: 0.0102 s
+- Max runtime: 0.1824 s
+- Average runtime: 0.0486458 s
+
+Observation:
+The UNSAT instances were slower on average because the solver must prove that no satisfying assignment exists, while SAT instances can terminate once one satisfying assignment is found.
