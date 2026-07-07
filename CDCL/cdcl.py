@@ -155,14 +155,43 @@ class CDCLSolver:
     
     def choose_variable(self):
         # Choose next variable to branch on
+        # Naive branching logic: pick the first unassigned variable
+        
         for var in range(1, self.num_variables() + 1):
             if var not in self.assignment:
                 return var
         return None
-    
+        '''
+        # Smart heuristic 1: Frequency based branching
+        counts = {} # frequency table, stores variable -> number of occurrences
+        for clause in self.clauses:  # look thru every clauses 
+            status, _ = self.check_clause(clause)
+
+            if status == 'SAT':  #skip clauses that are already satisfied
+                continue 
+
+            for lit in clause: 
+                var = abs(lit)
+            
+                if var not in self.assignment: 
+                    if var not in counts:
+                        counts[var] = 0
+                    counts[var] += 1
+        
+        best_var = None
+        best_count = -1 
+        for var in counts: 
+            if counts[var] > best_count: 
+                best_count = counts[var]
+                best_var = var
+        
+        return best_var
+        '''
+
     def analyze_conflict(self, conflict):
         # Analyze conflict and determine backtrack level
         # Simplified: backtrack to decision_level - 1
+        '''
         learned = [] 
         for d in self.decisions: 
             if self.assignment[d]: 
@@ -171,6 +200,26 @@ class CDCLSolver:
                 learned.append(d)
         self.clauses.append(learned)
         return max(0, self.decision_level - 1)
+        '''
+        # LEARN (trivial version: negation of all current decisions)
+        learned = []
+        for d in self.decisions:
+            if self.assignment[d]: 
+                learned.append(-d)
+            else: 
+                learned.append(d)
+        self.clauses.append(learned)
+
+        # BACKJUMP: second-highest decision level IN THE LEARNED CLAUSE
+        levels = set()
+        for lit in learned:
+            var = abs(lit)
+            if var in self.assignment_level:
+                levels.add(self.assignment_level[var])
+        levels = sorted(levels)
+        if len(levels) <= 1:
+            return 0
+        return levels[-2]
     
     def backtrack(self, level):
         # Backtrack to given decision level
