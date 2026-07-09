@@ -58,7 +58,30 @@ class CDCLSolver:
         self.implication_graph = []
         self.assignment_level = {} # for backtracking, maps variable to decision level
         self.decisions = []
+        self.occ = {} # list of occurrences of each variable in clauses, for heuristic branching
+        for idx, clause in enumerate(self.clauses): 
+            for lit in clause: 
+                self.occ.setdefault(abs(lit), []).append(idx) # store index of clause in which variable occurs
         
+        self.clause_true_count = [0] * len(self.clauses) # count of true literals in each clause
+
+        # helper functions
+    
+    def _on_assign(self, var, value): 
+        for idx in self.occ.get(var, []): 
+            for lit in self.clauses[idx]:
+                if abs(lit) == var: 
+                    if (lit > 0) == value: 
+                        self.clause_true_count[idx] += 1
+
+    def _on_unassign(self, var, value):
+        for idx in self.occ.get(var, []):
+            for lit in self.clauses[idx]:
+                if abs(lit) == var: 
+                    if (lit > 0) == value: 
+                        self.clause_true_count[idx] -= 1
+
+
     def solve(self):
         """
         Main CDCL solving algorithm.
@@ -157,36 +180,20 @@ class CDCLSolver:
         # Choose next variable to branch on
         # Naive branching logic: pick the first unassigned variable
         
+        '''
         for var in range(1, self.num_variables() + 1):
             if var not in self.assignment:
                 return var
         return None
         '''
-        # Smart heuristic 1: Frequency based branching
-        counts = {} # frequency table, stores variable -> number of occurrences
-        for clause in self.clauses:  # look thru every clauses 
-            status, _ = self.check_clause(clause)
-
-            if status == 'SAT':  #skip clauses that are already satisfied
-                continue 
-
-            for lit in clause: 
-                var = abs(lit)
-            
-                if var not in self.assignment: 
-                    if var not in counts:
-                        counts[var] = 0
-                    counts[var] += 1
-        
-        best_var = None
-        best_count = -1 
-        for var in counts: 
-            if counts[var] > best_count: 
-                best_count = counts[var]
-                best_var = var
-        
+        best_var, best_score = None, -1
+        for var in range(1, self.num_variables() + 1):
+            if var in self.assignment: 
+                continue
+            score = sum(1 for idx in self.occ.get(var, []) if self.clause_true_count[idx] == 0)
+            if score > best_score:
+                best_var, best_score = var, score
         return best_var
-        '''
 
     def analyze_conflict(self, conflict):
         # Analyze conflict and determine backtrack level
@@ -209,6 +216,14 @@ class CDCLSolver:
             else: 
                 learned.append(d)
         self.clauses.append(learned)
+        idx = len(self.clauses) - 1
+        self.clause_true_count.append(0) # initialize count for new learned clause
+        for lit in learned: 
+            v = abs(lit)
+            self.occ.setdefault(v, []).append(idx)
+            if v in self.assignment and (lit > 0) == self.assignment[v]:
+                self.clause_true_count[idx] += 1
+
 
         # BACKJUMP: second-highest decision level IN THE LEARNED CLAUSE
         levels = set()
@@ -229,6 +244,7 @@ class CDCLSolver:
                 vars_to_remove.append(var)
         
         for var in vars_to_remove: 
+            self._on_unassign(var, self.assignment[var]) # update clause_true_count
             del self.assignment[var]
             del self.assignment_level[var]
         
