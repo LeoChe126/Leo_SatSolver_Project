@@ -9,9 +9,9 @@
 #include <string>
 #include <filesystem>
 
-// DPLL algorithm
+// CDCL algorithm
 #include <chrono>
-#include <unordered_map>
+#include <utility>
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -22,247 +22,112 @@ struct CNF {
     std::vector<std::vector<int>> clauses;
 };
 
-// Simplifies the CNF when a certain variable is asserted true. If a conflict is encountered, returns the conflict indices.
-void simplify(CNF &formula, int lit, int &conflict1, int &conflict2) {
-    // CDCL: Undid most of the changes of fix(2) and replaced the .erase call in the previous DPLL implementation with swap-and-pop (if erase was causing that many issues)
-    // CNF newFormula;                                         // Creates a new CNF to store the simplified formula (fix(2))
-    // newFormula.num_variables = formula.num_variables;       // Copies the number of variables from the original formula (fix(2))
-    // newFormula.clauses.reserve(formula.clauses.size());     // Reserves space for the new clauses to avoid multiple allocations (fix(2))
+// TODO: Redo all relevant helper functions given that the CDCL uses a loop instead of recursion
 
-    // CDCL: Stores the indices of unit clauses of both polarities of lit.
-    // If both conflict1 is not -1 and conflict2 is not -1, then a resolveable conflict has arisen.
-    // If only conflict1 is not -1, that's impossible because unit propagation was run just before.
-    // If only conflict2 is not -1, then it's just doing normal behavior (simplifying an enforced clause from unit propagation)
-    conflict1 = -1;
-    conflict2 = -1;
+/* Checks if a certain assignment causes a conflict. If it does, returns the resolution clause.
+ * Inputs:
+ *      formula: Takes the formula from the main CDCL function.
+ *      assignments: Holds the assignments.
+ *      lit: The literal to check for conflict.
+ * Output:
+ *      Returns the resolution clause if a conflict occurs. Otherwise, returns an empty clause.
+ */
+std::vector<int> checkConflict(const CNF &formula, const std::vector<int> &assignments, int lit) {
+    std::vector<int> resolution;
+
     
-    for (int i = 0; i < formula.num_clauses; i++) {
-        bool satisfied = false;
-        std::vector<int> &clause = formula.clauses[i];
-        // std::vector<int> newClause;
 
-        for (int j = 0; j < clause.size(); j++) {
-            int x = clause[j];
-            if (x == lit) {
-                satisfied = true;
-                if(clause.size() == 1 && conflict2 == -1) conflict2 = i;
-                break;
-            }
-
-            if (clause.size() == 1 && x == -lit && conflict1 == -1) conflict1 = i;
-
-            if (x == -lit) {
-                clause[j] = clause.back();
-                clause.pop_back();
-                j--;
-            }
-
-            if(conflict1 != -1 && conflict2 != -1) return; // If both conflicts are detected, breaks out of the function.
-        }
-
-        // if (!satisfied) {
-        //     newFormula.clauses.push_back(newClause);
-        // } else { // CDCL: Need to add this to keep the indices of the individual clauses for conflict resolution.
-        //     newFormula.clauses.push_back({0});
-        // }
-
-        if(satisfied) { // CDCL: Need to add this to keep the indices of the individual clauses for conflict resolution.
-            formula.clauses[i] = {0};
-        }
-    }
+    return resolution;
 }
 
-/* Performs unit propagation
+/* Evaluates the CNF, performing unit propagation and conflict resolution.
  * Inputs:
- *     formula: Takes the formula from the layer above.
- *     assignments: Stores the assignments.
- *     exit: Outputs whether or not the unit propagation detects an impossible CNF.
- *     guess_level: Indicates the guess level of this current propagation.
- *     conflict1: Outputs the first index of the conflict (negative).
- *     conflict2: Outputs the second index of the conflict (positive).
+ *      formula: Takes the formula from the main CDCL function.
+ *      assignments: Holds the assignments.  
+ *      trail: Holds the backtracking trail for the assignments.
+ *      trail_level: Holds the guess levels for the backtracking trail.
+ *      guess_level: Indicates the guess level of the current propagation
  * Output:
- *     Returns the outcome of unit propagation
- *     0: Normal operation
- *     -1: Unit propagation fails normally
- *     >0: Conflict occurs with the literal as the output
+ *      Returns the status of the evaluation:
+ *          0: Normal execution
+ *          -1: Evaluation failed without conflict
+ *          >0: Conflict occurred, which stores the target level to backtrack to
+ *      Modifies formula to include learned clauses, assignments to have new assignments,
+ *      and trail to have the new backtracking trail.
  */
-int unitPropagation(CNF &formula, std::unordered_map<int,int> &assignments, std::unordered_map<int,int> &level, int guess_level, int &conflict1, int &conflict2) {
+int evaluateCNF(CNF &formula, std::vector<int> &assignments, std::vector<std::pair<int,int>> &trail,
+    std::vector<int> trail_level, int guess_level) {
+
+    int conflict1 = -1;
+    int conflict2 = -1;
+
     while(true) {
         int var = 0;
-        bool flag = false;
+        bool flag = true;
         for(int i = 0; i < formula.clauses.size(); i++) {
-            // Empty clause -> Automatically fails
-            if(formula.clauses[i].empty()) return 1;
-            
-            // Unit clause -> Automatically assigned to satisfy equation
-            if(formula.clauses[i].size() == 1) {
-                var = formula.clauses[i][0];
-                if(var != 0) { // CDCL: Added back the {0} checker since the index of clauses needs to be preserved.
-                    assignments[std::abs(var)] = (var > 0);
-                    level[std::abs(var)] = guess_level;
-                    flag = true;
-                    break;
-                }
+            vector<int> &clause = formula.clauses[i]
+            for(int j = 0; j < clause.size(); j++) {
+
             }
+            // Clause is satisfied, skip to next clause
+            
         }
 
         // Breaks loop if no more unit clauses are found
         if(!flag) {
             break;
         }
-
-        simplify(formula, var, conflict1, conflict2);
-        if(conflict1 != -1) return std::abs(var);
     }
 
-    return 0;
 }
 
-/* Performs conflict resolution.
+/* Runs the CDCL algorithm (but with a loop instead)
  * Inputs:
- *     top: Gets the top of the assignments and inserts the resolution clause.
- *     level: Gets the levels of the assignments.
- *     lit: Gets the literal causing the conflict.
- *     guess_level: Gets the guess_level of the current iteration.
+ *   formula: Takes the initial CNF that has literals from 1 to num_variables.
+ *   assignments: Holds the assignments.
  * Output:
- *     Returns the target level for the resolution. If it is -1, then the learned clause is empty and the algorithm should stop immediately.
+ *   Returns the verdict.
  */
-int conflictResolution(CNF &top, const std::unordered_map<int,int> &level, int lit, int guess_level, int conflict1, int conflict2) {
-    std::vector<int> clause1 = top.clauses[conflict1];
-    std::vector<int> clause2 = top.clauses[conflict2];
+bool CDCL(CNF formula, std::vector<int> &assignments) {
+    // Stores the backtracking trail for the assignments
+    std::vector<std::pair<int,int>> trail;
+    std::vector<int> trail_level;
 
-    std::vector<int> resolution;
+    int guess_level = 0;            // Stores the guess level of the current propagation
+    int target_level = 0;           // Stores the guess level that needs to be pulled back to (TODO: Implement backtracking)
+    int conflict1, conflict2 = -1;  // Stores the indices of the conflict for conflict resolution (negative, positive)
+    bool flag = false;              // Stores whether or not a conflict has been detected
 
-    for(int x : clause1) {
-        if((x != lit && x != -lit) && (std::find(resolution.begin(), resolution.end(), x) == resolution.end())) resolution.push_back(x);
-    }
-    
-    for(int x : clause2) {
-        if((x != lit && x != -lit) && (std::find(resolution.begin(), resolution.end(), x) == resolution.end())) resolution.push_back(x);
-    }
+    while (true) {
+        int status = unitPropagation(formula, assignments, level, guess_level, conflict1, conflict2);
 
-    if(resolution.size() == 0) {
-        return -1;
-    }
-
-    top.clauses.push_back(resolution);
-
-    int target_level = 0;
-
-    for(int i = 0; i < resolution.size(); i++) {
-        auto it = level.find(resolution[i]);
-        if(it != level.end()) {
-            int var = it->second;
-            if(var > target_level && var < guess_level) {
-                target_level = var;
-            }
+        // CDCL: Unit propagation runs into a conflict
+        if(status > 0) {
+            target_level = conflictResolution(formula, level, status, guess_level, conflict1, conflict2);
         }
-    }
 
-    return target_level;
-}
-
-// Helper function, replace that decision step with a direct scan for the first available nonzero literal. (Align with python implementation)
-int chooseFirstLiteral(const CNF& formula) {    // fix(1): branching logic changed to select the first available literal (align with Python implementation)
-    for (const auto& clause : formula.clauses) {
-        for (int lit : clause) {
-            if (lit != 0) {
-                return lit;
+        // Base Case 1: no clauses left means all clauses were satisfied
+        // Base Case 2: an empty clause means this branch failed
+        bool verdict = true;
+        for (const auto& clause : formula.clauses) {
+            if (clause.empty()) {
+                flag = true;
+                verdict = false;
+                continue;
             }
+
+            verdict = verdict && (clause.size() == 1 && clause[0] == 0);
         }
+
+        if(verdict) return true;
+
+        int lit = chooseFirstLiteral(formula);
+        if(lit == 0) return false;
+
+
     }
-
-    return 0; // only happens if no decision literal exists
-}
-
-/* Runs the CDCL algorithm.
- * Inputs:
- *     formula: Takes the formula from the layer above.
- *     top: Holds the formula at the topmost layer. Relevant for conflict resolution.
- *     assignments: Holds the assignments.
- *     level: Holds the levels for the assignments.
- *     guess_level: Indicates the guess level of this current propagation.
- *     target_level: Outputs the guess level that needs to be pulled back
- *     conflict1: Outputs the first index of the conflict for conflict resolution (negative).
- *     conflict2: Outputs the second index of the conflict for conflict resolution (positive).
- * Output:
- *     Returns the verdict.
- */
-bool CDCL(CNF formula, CNF &top, std::unordered_map<int,int> &assignments, std::unordered_map<int,int> &level, 
-    int guess_level, int &target_level, int &conflict1, int &conflict2) {
-
-    int status = unitPropagation(formula, assignments, level, guess_level, conflict1, conflict2);
-    
-    // CDCL: Unit propagation runs into a conflict
-    if(status > 0) {
-        target_level = conflictResolution(top, level, status, guess_level, conflict1, conflict2);
-    }
-
-    // Unit propagation fails (also includes conflict)
-    if(status != 0) return false;
-
-    // Base Case 1: no clauses left means all clauses were satisfied
-    // Base Case 2: an empty clause means this branch failed
-    bool verdict = true;
-    for (const auto& clause : formula.clauses) {
-        if (clause.empty()) return false;
-
-        if(clause.size() != 1 || clause[0] != 0) verdict = false;
-    }
-
-    if(verdict) return true;
-
-    // Recursion: Selects the first unassigned literal, then tries simplifying with both positive and negative inputs.
-    int lit = chooseFirstLiteral(formula);
-
-    if (lit == 0) return false;
-
-    std::unordered_map<int,int> a = assignments;
-    std::unordered_map<int,int> l = level;
-    
-    a.insert({std::abs(lit), lit > 0});
-    l.insert({std::abs(lit), guess_level + 1});
-
-    CNF simplified = formula;
-    simplify(simplified, lit, conflict1, conflict2);
-    bool v = CDCL(simplified, top, a, l, guess_level + 1, target_level, conflict1, conflict2);
-
-    if (v) {
-        assignments = a;
-        return true;
-    } else if(conflict1 != -1) { // CDCL: Conflict is detected
-        if(target_level == -1) { // Learned clause is empty
-            return false;
-        } else if(guess_level == target_level) {
-            // Adds all the learned clauses from top then simplifies using the current assignments
-            int top_size = top.clauses.size();
-            for(int i = formula.num_clauses; i < top_size; i++) {
-                formula.clauses.push_back(top.clauses[i]);
-                formula.num_clauses++;
-            }
-
-            for(const auto& pair : assignments) {
-                simplify(formula, pair.first * (pair.second ? 1 : -1), conflict1, conflict2);
-                if(conflict1 != -1) { // A new conflict shows up while trying to simplify
-                    target_level = conflictResolution(top, level, status, guess_level, conflict1, conflict2);
-                    return false;
-                }
-            }
-
-            return CDCL(formula, top, assignments, level, guess_level, target_level, conflict1, conflict2);
-        }
-    }
-
+    // If the loop somehow exits, return false (this should never happen)
     return false;
-}
-
-// Initializes the CDCL algorithm
-bool initCDCL(CNF formula, std::unordered_map<int,int> assignments) {
-    CNF top = formula;
-    std::unordered_map<int,int> level;
-    int target_level = 0;
-    int conflict1, conflict2 = -1;
-    return CDCL(formula, top, assignments, level, 0, target_level, conflict1, conflict2);
 }
 
 // Copied from AI, modified slightly for clarity
@@ -344,8 +209,32 @@ CNF parseFile(const std::string& filename) {
     return formula;
 }
 
+// Reformats the CNF to a more usable form. Example: (1, 2, 3) instead of (1, 6, 3)
+// Returns the key by pass-by-reference, which can be used to map the original literals to the reformatted ones
+// The key index represents what literal is used to represent it (index of 0 goes to 1, index of 1 goes to 2, etc.)
+CNF reformat(const CNF formula, std::vector<int> &key) {
+    CNF newFormula;
+    newFormula.num_variables = formula.num_variables;
+    newFormula.num_clauses = formula.num_clauses;
 
-//const int MODE = 2; //Terminal inputs is now used to select the mode, no longer needed. 
+    for(int i = 0; i < formula.num_clauses; i++) {
+        std::vector<int> newClause;
+        
+        for(int j = 0; j < formula.clauses[i].size(); j++) {
+            int lit = formula.clauses[i][j];
+            auto it = std::find(key.begin(), key.end(), std::abs(lit));
+            int index = std::distance(key.begin(), it);
+
+            if(it == key.end()) {
+                key.push_back(std::abs(lit));
+            }
+            newClause.push_back((index + 1) * (lit > 0 ? 1 : -1));
+        }
+
+        newFormula.clauses.push_back(newClause);
+    }
+    return newFormula;
+}
 
 // Command for generating cdcl.exe: g++ -o dpll DPLL.cpp
 // Command for running program: ./cdcl "[X]", where X is the name of the file location of the dataset.
@@ -395,10 +284,13 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
 
         CNF formula = parseFile(filename);
 
+        std::vector<int> key;
+        CNF reformat_formula = reformat(formula, key);
+
         auto start = std::chrono::high_resolution_clock::now();
 
-        std::unordered_map<int, int> assignments;
-        bool verdict = initCDCL(formula, assignments);
+        std::vector<int> assignments;
+        bool verdict = initCDCL(reformat_formula, assignments);
 
         auto end = std::chrono::high_resolution_clock::now();
 
