@@ -1,6 +1,5 @@
 import sys
 import time
-import signal
 import os
 
 def parseFile(text):
@@ -49,206 +48,201 @@ def parseFile(text):
 
     return num_vars, clauses
 
-class CDCLSolver:
-    def __init__(self, clauses):
 
+class CDCLSolver:
+    def __init__(self, clauses, num_vars=None):
         self.clauses = clauses
-        self.assignment = {}  # variable -> True/False
+
+        # Change 1: cache variable count
+        if num_vars is not None:
+            self.n = num_vars
+        else:
+            max_var = 0
+            for clause in clauses:
+                for lit in clause:
+                    var = abs(lit)
+                    if var > max_var:
+                        max_var = var
+            self.n = max_var   
+
+        # Change 2: flat lists instead of dicts
+        self.value = [None] * (self.n + 1)   # None = unassigned
+        self.level = [0] * (self.n + 1)      # decision level of each assignment
+        self.num_assigned = 0
+
+        # Change 3: assignment trail for fast backtracking
+        self.trail = []
+
         self.decision_level = 0
-        self.implication_graph = []
-        self.assignment_level = {} # for backtracking, maps variable to decision level
         self.decisions = []
-        
+
+        # Change 4: occurrence map (var -> clause indices) 
+        self.occ = {}
+        for idx, clause in enumerate(self.clauses):
+            for lit in clause:
+                self.occ.setdefault(abs(lit), []).append(idx)
+
+    def assign(self, var, val):
+        # Single place where assignment bookkeeping happens
+        self.value[var] = val
+        self.level[var] = self.decision_level
+        self.num_assigned += 1
+        self.trail.append(var)
+
     def solve(self):
         """
         Main CDCL solving algorithm.
-        
+
         Returns True if satisfiable, False otherwise
         """
-        # resets solver state for new solve attempt
+        # Reset solver state for new solve attempt
         self.decision_level = 0
-        self.assignment = {}  
-        self.assignment_level = {}  
+        self.value = [None] * (self.n + 1)
+        self.level = [0] * (self.n + 1)
+        self.num_assigned = 0
+        self.trail = []
         self.decisions = []
-        
+
+        # One full scan to catch original unit clauses, then queue-driven
+        conflict = self.initial_propagate()
+
         while True:
-            conflict = self.propagate()
-            
-            if conflict is None:
+            if conflict is not None:
+                # Conflict detected
+                if self.decision_level == 0:
+                    return False
+
+                backtrack_level, learned = self.analyze_conflict(conflict)
+                self.backtrack(backtrack_level)
+                self.decision_level = backtrack_level
+
+                # The learned clause is unit after backtracking:
+                # assign its literal and propagate from there.
+                status, unit_lit = self.check_clause(learned)
+                if status == 'UNSAT':
+                    conflict = learned
+                    continue
+                seeds = []
+                if status == 'UNIT':
+                    v = abs(unit_lit)
+                    self.assign(v, unit_lit > 0)
+                    seeds = [v]
+                conflict = self.propagate(seeds)
+
+            else:
                 # No conflict, check if all variables assigned
-                if len(self.assignment) == self.num_variables():
-                    return True 
-                
+                if self.num_assigned == self.n:
+                    return True
+
                 # Choose next variable to branch on
                 var = self.choose_variable()
                 self.decision_level += 1
-                self.assignment[var] = True
-                self.assignment_level[var] = self.decision_level
+                self.assign(var, True)
                 self.decisions.append(var)
+                conflict = self.propagate([var])
 
-            else:
-                #  Conflict detected
-                if self.decision_level == 0:
-                    return False
-                
-                # Analyze conflict and backtrack
-                backtrack_level = self.analyze_conflict(conflict)
-                self.backtrack(backtrack_level)
-                self.decision_level = backtrack_level
-    
-    def propagate(self):
-        
-        # Unit propagation with BCP (Boolean Constraint Propagation)
-        changed = True
-        while changed: # keep propagating as long as last iteration assigned a new variable (at least 1)
-            changed = False
-            for clause in self.clauses:
+    def initial_propagate(self):
+        # Full scan once, to find unit/empty clauses in the original formula
+        queue = []
+        for clause in self.clauses:
+            status, unit_lit = self.check_clause(clause)
+            if status == 'UNSAT':
+                return clause
+            if status == 'UNIT':
+                v = abs(unit_lit)
+                if self.value[v] is None:
+                    self.assign(v, unit_lit > 0)
+                    queue.append(v)
+        return self.propagate(queue)
+
+    def propagate(self, seeds):
+        # Queue-driven unit propagation, only look at clauses containing variables that were just assigned.
+        queue = list(seeds)
+        while queue:
+            var = queue.pop()
+            for idx in self.occ.get(var, []):
+                clause = self.clauses[idx]
                 status, unit_lit = self.check_clause(clause)
-                
+
                 if status == 'UNSAT':
                     return clause
-                
-                if status == 'UNIT': #exactly 1 unassigned literal
-                    var = abs(unit_lit)
-                    value = unit_lit > 0 #TRUE
-                    if var not in self.assignment:
-                        self.assignment[var] = value
-                        self.assignment_level[var] = self.decision_level
-                        changed = True
 
-        return None # no conflict found 
-    
+                if status == 'UNIT':
+                    v = abs(unit_lit)
+                    if self.value[v] is None:
+                        self.assign(v, unit_lit > 0)
+                        queue.append(v)
+
+        return None  # no conflict found
+
     def check_clause(self, clause):
-        # Check clause status: True, False, or None (unresolved)
-        # Returns ('SAT', None) | ('CONFLICT', None) | ('UNIT', lit) | ('UNRESOLVED', None).
-        # report four distinct states, and only assign on genuine units
+        # Check clause status.
+        # Returns ('SAT', None) | ('UNSAT', None) | ('UNIT', lit) | ('UNRESOLVED', None)
         unassigned = []
-        
+
         for lit in clause:
-            var = abs(lit)
-            if var in self.assignment:
-                if self.assignment[var] == (lit > 0):
-                    return ('SAT', None) # one true literal satisfies the clause
-                
-            else:
+            v = self.value[abs(lit)]
+            if v is None:
                 unassigned.append(lit)
-        
+            elif v == (lit > 0):
+                return ('SAT', None)  # one true literal satisfies the clause
+
         if len(unassigned) == 0:
             return ('UNSAT', None)
-        
+
         if len(unassigned) == 1:
             return ('UNIT', unassigned[0])
-        else: 
-            return ('UNRESOLVED', None)
-    
-    # no longer needed since propagate finds unassigned literals. 
-    """
-    def get_unassigned_literal(self, clause):
-        # Get unassigned literal in clause
-        for lit in clause:
-            if abs(lit) not in self.assignment:
-                return lit
-        return None
-    """
 
+        return ('UNRESOLVED', None)
 
-    
     def choose_variable(self):
-        # Choose next variable to branch on
-        # Naive branching logic: pick the first unassigned variable
-        
-        for var in range(1, self.num_variables() + 1):
-            if var not in self.assignment:
+        # Naive branching: pick the first unassigned variable
+        for var in range(1, self.n + 1):
+            if self.value[var] is None:
                 return var
         return None
-        '''
-        # Smart heuristic 1: Frequency based branching
-        counts = {} # frequency table, stores variable -> number of occurrences
-        for clause in self.clauses:  # look thru every clauses 
-            status, _ = self.check_clause(clause)
-
-            if status == 'SAT':  #skip clauses that are already satisfied
-                continue 
-
-            for lit in clause: 
-                var = abs(lit)
-            
-                if var not in self.assignment: 
-                    if var not in counts:
-                        counts[var] = 0
-                    counts[var] += 1
-        
-        best_var = None
-        best_count = -1 
-        for var in counts: 
-            if counts[var] > best_count: 
-                best_count = counts[var]
-                best_var = var
-        
-        return best_var
-        '''
 
     def analyze_conflict(self, conflict):
-        # Analyze conflict and determine backtrack level
-        # Simplified: backtrack to decision_level - 1
-        '''
-        learned = [] 
-        for d in self.decisions: 
-            if self.assignment[d]: 
-                learned.append(-d)
-            else: 
-                learned.append(d)
-        self.clauses.append(learned)
-        return max(0, self.decision_level - 1)
-        '''
         # LEARN (trivial version: negation of all current decisions)
         learned = []
         for d in self.decisions:
-            if self.assignment[d]: 
+            if self.value[d]:
                 learned.append(-d)
-            else: 
+            else:
                 learned.append(d)
         self.clauses.append(learned)
 
-        # BACKJUMP: second-highest decision level IN THE LEARNED CLAUSE
+        # Register the learned clause in the occurrence map
+        idx = len(self.clauses) - 1
+        for lit in learned:
+            self.occ.setdefault(abs(lit), []).append(idx)
+
+        # backjump: second-highest decision level in the learned clause
         levels = set()
         for lit in learned:
             var = abs(lit)
-            if var in self.assignment_level:
-                levels.add(self.assignment_level[var])
+            if self.value[var] is not None:
+                levels.add(self.level[var])
         levels = sorted(levels)
         if len(levels) <= 1:
-            return 0
-        return levels[-2]
-    
+            return 0, learned
+        return levels[-2], learned
+
     def backtrack(self, level):
-        # Backtrack to given decision level
-        vars_to_remove = []
-        for var in self.assignment: 
-            if self.assignment_level[var] > level:
-                vars_to_remove.append(var)
-        
-        for var in vars_to_remove: 
-            del self.assignment[var]
-            del self.assignment_level[var]
-        
-        remaining_decisions = []
-        for var in self.decisions: 
-            if var in self.assignment: 
-                remaining_decisions.append(var)
-        
-        self.decisions = remaining_decisions
-    
+        # Assignments happen in level order, so everything above `level` is a suffix of the trail: just pop it off.
+        while self.trail and self.level[self.trail[-1]] > level:
+            var = self.trail.pop()
+            self.value[var] = None
+            self.num_assigned -= 1
+
+        # Same suffix property holds for decisions
+        while self.decisions and self.value[self.decisions[-1]] is None:
+            self.decisions.pop()
+
     def num_variables(self):
-        # Get number of variables
-        max_var = 0
-        for clause in self.clauses:
-            for lit in clause:
-                max_var = max(max_var, abs(lit))
-        return max_var
+        return self.n
 
 
-# same as DPLL 
 if __name__ == "__main__":
     if len(sys.argv) not in (2, 3):
         print("Usage: python3 cdcl.py <benchmark_folder> [output_csv]")
@@ -275,6 +269,7 @@ if __name__ == "__main__":
     if not files:
         print(f"ERROR: No .cnf files found in {benchmark_folder}")
         sys.exit(1)
+
     times = []
     sat_count = 0
     unsat_count = 0
@@ -295,7 +290,7 @@ if __name__ == "__main__":
 
             num_vars, clauses = parseFile(text)
 
-            solver = CDCLSolver(clauses)
+            solver = CDCLSolver(clauses, num_vars)
 
             start = time.perf_counter()
             result = solver.solve()
@@ -350,4 +345,3 @@ if __name__ == "__main__":
 
     if output_csv is not None:
         print(f"Results written to {output_csv}")
-   
