@@ -1,6 +1,17 @@
 
 // Purpose: Simulate a CDCL algorithm on SATLIB benchmark problems from University of British Columbia
 
+/* General comments:
+ * A lot of the indices for the vectors (notably assignments and trail_level) are indexed by literal.
+ * Example 1: The literal "1" would have its value stored at assignment[1] and its trail level at trail_level[1].
+ * Example 2: The literal "-3" would have its value stored at assignment[3] and its trail level at trail_level[3].
+ * 
+ * For the assignments, "0" indicates that the literal is unassigned while 1/-1 represents true/false respectively.
+ * 
+ * For the trail, the backtracking is stored chronologically with the most recent changes being at the back of the vector.
+ * The trail stores the literals that were assigned at certain times and may be undone by going from back to front.
+ */
+
 // File parsing
 #include <iostream>
 #include <fstream>
@@ -24,61 +35,171 @@ struct CNF {
 
 // TODO: Redo all relevant helper functions given that the CDCL uses a loop instead of recursion
 
-/* Checks if a certain assignment causes a conflict. If it does, returns the resolution clause.
+/* Checks if a certain literal causes a conflict. If it does, returns the resolution clause.
  * Inputs:
  *      formula: Takes the formula from the main CDCL function.
  *      assignments: Holds the assignments.
  *      lit: The literal to check for conflict.
  * Output:
- *      Returns the resolution clause if a conflict occurs. Otherwise, returns an empty clause.
+ *      Returns the resolution clause if a conflict occurs. Otherwise, returns a {0} clause.
  */
 std::vector<int> checkConflict(const CNF &formula, const std::vector<int> &assignments, int lit) {
-    std::vector<int> resolution;
-
-    
-
-    return resolution;
-}
-
-/* Evaluates the CNF, performing unit propagation and conflict resolution.
- * Inputs:
- *      formula: Takes the formula from the main CDCL function.
- *      assignments: Holds the assignments.  
- *      trail: Holds the backtracking trail for the assignments.
- *      trail_level: Holds the guess levels for the backtracking trail.
- *      guess_level: Indicates the guess level of the current propagation
- * Output:
- *      Returns the status of the evaluation:
- *          0: Normal execution
- *          -1: Evaluation failed without conflict
- *          >0: Conflict occurred, which stores the target level to backtrack to
- *      Modifies formula to include learned clauses, assignments to have new assignments,
- *      and trail to have the new backtracking trail.
- */
-int evaluateCNF(CNF &formula, std::vector<int> &assignments, std::vector<std::pair<int,int>> &trail,
-    std::vector<int> trail_level, int guess_level) {
-
     int conflict1 = -1;
     int conflict2 = -1;
 
-    while(true) {
-        int var = 0;
-        bool flag = true;
-        for(int i = 0; i < formula.clauses.size(); i++) {
-            vector<int> &clause = formula.clauses[i]
-            for(int j = 0; j < clause.size(); j++) {
+    for(int i = 0; i < formula.num_clauses; i++) {
+        const std::vector<int> &clause = formula.clauses[i];
+        auto begin = clause.begin();
+        auto end = clause.end();
 
+        bool pos = std::find(begin, end, lit) != end;
+        bool neg = std::find(begin, end, -lit) != end;
+
+        // If the literal does not exist in this clause, it can be skipped
+        if((pos || neg) == false) continue;
+
+        // If a clause that contains the literal is already satisfied or is unassigned, it can be skipped.
+        bool flag = false;
+        for(int x : clause) {
+            if(x == lit || x == -lit) continue;
+
+            int value = assignments[std::abs(x)];
+            if(value == 0 || value == (x > 0 ? 1 : -1)) {
+                flag = true;
+                break;
             }
-            // Clause is satisfied, skip to next clause
-            
+        }
+        if(flag) continue;
+
+        // Clause contains only the literal unassigned
+        // TODO: Potential edgecase that a clause has both x and -x, making the indices be identical (hence the clause should be ignored)
+        if(conflict1 == -1 && pos) conflict1 = i;
+        if(conflict2 == -1 && neg) conflict2 = i;
+
+        if(conflict1 != -1 && conflict2 != -1) break;
+    }
+
+    // Conflict is detected
+    if(conflict1 != -1 && conflict2 != -1) {
+        std::vector<int> resolution;
+
+        const std::vector<int> &clause1 = formula.clauses[conflict1];
+        const std::vector<int> &clause2 = formula.clauses[conflict2];
+
+        for(int x : clause1) {
+            if((x != lit && x != -lit) && (std::find(resolution.begin(), resolution.end(), x) == resolution.end())) resolution.push_back(x);
+        }
+        
+        for(int x : clause2) {
+            if((x != lit && x != -lit) && (std::find(resolution.begin(), resolution.end(), x) == resolution.end())) resolution.push_back(x);
+        }
+
+        return resolution;
+    }
+
+    // No conflict is detected (returns {0})
+    return {0};
+}
+
+/* Performs unit propagation and processes conflict resolution. Returns the target_level from conflict resolution.
+ * Inputs:
+ *      formula: Takes the formula from the main CDCL function.
+ *      assignments: Holds the assignments.
+ *      trail: Holds the backtracking trail for the assignments.
+ *      trail_level: Holds the guess levels for the backtracking trail.
+ *      guess_level: Indicates the guess level of the current propagation.
+ * Output:
+ *      Returns the status of the evaluation:
+ *          -1: Normal execution
+ *          -2: Evaluation failed, should force a quit.
+ *          >= 0: Conflict occurred, which stores the target level to backtrack to
+ *      Modifies formula to include learned clauses, assignments to have new assignments, and trail to have the new backtracking trail.
+ * 
+ *      Note: An output of -2 can only happen if either the resolution clause is empty
+ */
+int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int> &trail,
+    std::vector<int> trail_level, int guess_level) {
+
+    // Unit Propagation
+    while(true) {
+        bool flag = true;
+        for(int i = 0; i < formula.num_clauses; i++) {
+            // Various flags to check the status of the clause.
+            bool unsat = true;
+            bool unit = false;
+            int lit = 0;
+            std::vector<int> &clause = formula.clauses[i];
+
+            for(int x : clause) {
+                int value = assignments[std::abs(x)];
+
+                // If the clause is already satisfied (TODO: Could be optimized to have a separate tracker for which clauses are already satisfied?)
+                // x = 0 should be impossible.
+                if(value == (x > 0 ? 1 : -1)) {
+                    unsat = false;
+                    lit = -1;
+                    break;
+                }
+
+                // If an unassigned literal is found, unsatisfiable is flagged to be false
+                if(unsat && value == 0) unsat = false;
+
+                // Stores the unassigned literal and flags as a unit clause when first unassigned literal is detected.
+                if(lit == 0 && value == 0) {
+                    unit = true;
+                    lit = x;
+                    continue;
+                }
+
+                // Unflags unit clause if another unassigned literal is detected
+                if(unit && value == 0) {
+                    unit = false;
+                    continue;
+                }
+            }
+
+            // Somehow there is an unsatisfiable clause
+            if(unsat) return -2;
+
+            // Unit clause found
+            if(unit) {
+                flag = false;
+                std::vector<int> resolution = checkConflict(formula, assignments, lit);
+
+                int size = resolution.size();
+
+                // No conflict detected
+                if(size == 1 && resolution[0] == 0) {
+                    int index = std::abs(lit);
+                    assignments[index] = (lit > 0 ? 1 : -1);
+                    trail.push_back(index);
+                    trail_level[index] = guess_level;
+                    break;
+
+                // Conflict detected
+                } else {
+                    int target_level = -2;
+                    for(int x : resolution) {
+                        int t = trail_level[std::abs(x)];
+                        if(t > target_level) target_level = t;
+                    }
+
+                    // Updates the CNF
+                    if(target_level != -2) {
+                        formula.clauses.push_back(resolution);
+                        formula.num_clauses++;
+                    }
+
+                    return target_level;
+                }
+            }
         }
 
         // Breaks loop if no more unit clauses are found
-        if(!flag) {
-            break;
-        }
+        if(flag) break;
     }
 
+    return -1;
 }
 
 /* Runs the CDCL algorithm (but with a loop instead)
@@ -90,20 +211,21 @@ int evaluateCNF(CNF &formula, std::vector<int> &assignments, std::vector<std::pa
  */
 bool CDCL(CNF formula, std::vector<int> &assignments) {
     // Stores the backtracking trail for the assignments
-    std::vector<std::pair<int,int>> trail;
-    std::vector<int> trail_level;
+    std::vector<int> trail;
+    std::vector<int> trail_level(formula.num_variables + 1);
 
-    int guess_level = 0;            // Stores the guess level of the current propagation
-    int target_level = 0;           // Stores the guess level that needs to be pulled back to (TODO: Implement backtracking)
-    int conflict1, conflict2 = -1;  // Stores the indices of the conflict for conflict resolution (negative, positive)
-    bool flag = false;              // Stores whether or not a conflict has been detected
+    int guess_level = 0;  // Stores the guess level of the current propagation
+    int target_level = 0; // Stores the guess level that needs to be pulled back to
 
     while (true) {
-        int status = unitPropagation(formula, assignments, level, guess_level, conflict1, conflict2);
+        int status = unitPropagation(formula, assignments, trail, trail_level, guess_level);
 
-        // CDCL: Unit propagation runs into a conflict
-        if(status > 0) {
-            target_level = conflictResolution(formula, level, status, guess_level, conflict1, conflict2);
+        // Unit propagation detects an unsat
+        if(status == -2) return false;
+
+        // Unit propagation runs into a conflict
+        if(status >= 0) {
+            
         }
 
         // Base Case 1: no clauses left means all clauses were satisfied
@@ -289,7 +411,7 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
 
         auto start = std::chrono::high_resolution_clock::now();
 
-        std::vector<int> assignments;
+        std::vector<int> assignments(reformat_formula.num_variables + 1);
         bool verdict = initCDCL(reformat_formula, assignments);
 
         auto end = std::chrono::high_resolution_clock::now();
