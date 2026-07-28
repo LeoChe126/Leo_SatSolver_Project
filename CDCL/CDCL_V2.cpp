@@ -5,6 +5,10 @@
  *      Main algorithm runs with loops instead of recursion
  *      No longer mutates/copies the original CNF, instead using backtracking
  *      Uses a different conflict resolution algorithm (1-UIP)
+ * Version 2.1 changes:
+ *      Added tracking for various data points using a new struct
+ *      Integrated the base case conditions for the main loop into the unit propagation
+ *      Added a mode switcher for heuristics and added 2 new heuristics
  */
 
 /* General comments:
@@ -42,6 +46,14 @@ struct CNF {
     std::vector<std::vector<int>> clauses;
 };
 
+struct data {
+    int num_decisions = 0;    // Total number of decisions made by heuristic
+    int num_assignments = 0;  // Total number of unit propagation assignments
+    int num_backtrack = 0;    // Total number of guess levels backtracked
+    int num_resolutions = 0;  // Total number of resolution clauses added
+};
+
+// Function for debugging
 void printCNF(const CNF &formula) {
     for(int i = 0; i < formula.num_clauses; i++) {
         const auto &clause = formula.clauses[i];
@@ -65,6 +77,7 @@ void printCNF(const CNF &formula) {
  *      assignment_reason: Holds the clause index for the reason for corresponding assignments. -1 for any decisions.
  *      guess_level: The guess level of the current state.
  *      conflictIndex: The index of the clause that causes the conflict.
+ *      d: Stores the tracking data
  * Output:
  *      Returns the status of conflict resolution:
  *          -1: Critical error of some sort, fails and executes program immediately.
@@ -72,7 +85,7 @@ void printCNF(const CNF &formula) {
  *          1: Unresolvable conflict is detected, should exit immediately.
  */
 int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int> &trail, 
-    std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, int conflictIndex) {
+    std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, int conflictIndex, data &d) {
 
     // Resolution clause
     std::vector<int> resolution = formula.clauses[conflictIndex];
@@ -154,6 +167,7 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
     if(target_level != -1) {
         formula.clauses.push_back(resolution);
         formula.num_clauses++;
+        d.num_resolutions++;
 
         // Backtracking
         while(!trail.empty()) {
@@ -167,6 +181,7 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
             trail.pop_back();
             assignment_level[var] = -1;
             assignment_reason[var] = -2;
+            d.num_backtrack++;
         }
 
         // If backtracked too far: Error
@@ -181,6 +196,7 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
         trail.push_back(index);
         assignment_level[index] = target_level;
         assignment_reason[index] = formula.num_clauses - 1; // New resolution clause should be the one at the very back
+        d.num_resolutions++;
 
         guess_level = target_level;
 
@@ -200,19 +216,22 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
  *      assignment_level: Holds the guess levels for given assignments
  *      assignment_reason: Holds the clause index for the reason for corresponding assignments. -1 for any decisions.
  *      guess_level: Indicates the guess level of the current propagation.
+ *      d: Stores the tracking data
  * Output:
  *      Returns the status of the evaluation:
  *          -1: Critical error of some sort
  *          0: Normal execution
  *          1: Unit propagation results in an unresolvable conflict, should quit out.
+ *          2: Unit propagation finds a fully satisfied CNF, should quit out.
  *      Modifies formula to include learned clauses, assignments to have new assignments, and trail to have the new backtracking trail.
  *      Note: Any modifications made as part of an incomplete unit propagation should be undone when doing conflict resolution.
  */
 int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int> &trail,
-    std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level) {
+    std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, data &d) {
 
     // Unit Propagation
     while(true) {
+        bool allSat = true;
         bool flag = true;
         for(int i = 0; i < formula.num_clauses; i++) {
             // Various flags to check the status of the clause.
@@ -224,8 +243,9 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
             for(int x : clause) {
                 int value = assignments[std::abs(x)];
 
-                // If the clause is already satisfied (TODO: Could be optimized to have a separate tracker for which clauses are already satisfied?)
-                // x = 0 should be impossible.
+                // If the clause is already satisfied 
+                // TODO: Could be optimized to have a separate tracker for which clauses are already satisfied?
+                // Apparently two-watched literals implements this idea but better.
                 if(value == (x > 0 ? 1 : -1)) {
                     sat = true;
                     break;
@@ -242,7 +262,7 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
 
             // Unsatisfiable clause found, need to perform conflict resolution
             if(count == 0) {
-                int status = resolveConflict(formula, assignments, trail, assignment_level, assignment_reason, guess_level, i);
+                int status = resolveConflict(formula, assignments, trail, assignment_level, assignment_reason, guess_level, i, d);
 
                 // If conflict is successfully resolved, tries propagation again.
                 if(status == 0) {
@@ -261,44 +281,113 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
                 trail.push_back(index);
                 assignment_level[index] = guess_level;
                 assignment_reason[index] = i;
+                d.num_assignments++;
 
                 flag = false;
                 break;
             }
+
+            // A clause is not satisfied. (This flag does not need to be kept track of if any of the above if statements are triggered since a new propagation starts)
+            allSat = false;
         }
 
         // Breaks loop if no more unit clauses are found
-        if(flag) break;
+        if(flag) {
+            if(allSat) return 2;
+
+            return 0;
+        }
     }
 
+    // Fallout return statement
     return 0;
 }
 
 /* Chooses a literal to guess (TODO: Implement better heuristics using variable ordering and initial state selection)
  * Inputs:
- *   formula: Takes the initial CNF that has literals from 1 to num_variables.
- *   assignments: Holds the assignments.
+ *      formula: Takes the initial CNF that has literals from 1 to num_variables.
+ *      assignments: Holds the assignments.
+ *      d: Stores the tracking data
  * Output:
- *   Returns the chosen literal.
+ *      Returns the chosen literal.
+ * 
+ * Current Modes:
+ *      0: Simple naive heuristic, chooses first unassigned literal found
+ *      1: Highest unassigned unsigned literal frequency. Always returns a positive literal.
+ *      2: Highest unassigned signed literal frequency.
  */
-int chooseLiteral(const CNF &formula, const std::vector<int> &assignments) {
-    // Simple naive heuristic
-    for(const auto &clause : formula.clauses) {
-        for(int x : clause) {
-            if(assignments[std::abs(x)] == 0) return x;
+int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const int H_MODE) {
+    switch(H_MODE) {
+        case 0: { // Simple naive heuristic
+            for(const auto &clause : formula.clauses) {
+                for(int x : clause) {
+                    if(assignments[std::abs(x)] == 0) return x;
+                }  
+            }
+            return 0;
         }
+
+        case 1: { // Highest unassigned literal frequency (unsigned, always positive) TODO: Don't like how it creates a new vector each time. Better way of tracking?
+            int lit = 0;
+            int maxCount = 0;
+            std::vector<int> counts(formula.num_variables + 1);
+            for(const auto &clause : formula.clauses) {
+                for(int x : clause) {
+                    int l = std::abs(x);
+                    if(assignments[l] != 0) continue;
+                    int c = ++counts[l];
+                    if(c > maxCount) {
+                        lit = l;
+                        maxCount = c;
+                    }
+                }
+            }
+            return lit;
+        }
+
+        case 2: { // Highest unassigned literal frequency (signed) TODO: Same situation as case above but twice as bad.
+            int lit = 0;
+            int maxCount = 0;
+            std::vector<int> posCounts(formula.num_variables + 1);
+            std::vector<int> negCounts(formula.num_variables + 1);
+            for(const auto &clause : formula.clauses) {
+                for(int x : clause) {
+                    if(assignments[std::abs(x)] != 0) continue;
+                    int c;
+
+                    if(x > 0) {
+                        c = ++posCounts[x];
+                    } else {
+                        c = ++negCounts[-x];
+                    }
+
+                    if(c > maxCount) {
+                        lit = x;
+                        maxCount = c;
+                    }
+                }
+            }
+            return lit;
+        }
+
+        default:
+            std::cout << "ERROR: Unknown heuristic mode chosen" << std::endl;
+            break;
     }
+
+    // Fallout return (for default case)
     return 0;
 }
 
 /* Runs the CDCL algorithm (but with a loop instead)
  * Inputs:
- *   formula: Takes the initial CNF that has literals from 1 to num_variables.
- *   assignments: Holds the assignments.
+ *      formula: Takes the initial CNF that has literals from 1 to num_variables.
+ *      assignments: Holds the assignments.\
+ *      d: Stores the tracking data
  * Output:
- *   Returns the verdict.
+ *      Returns the verdict.
  */
-bool CDCL(CNF &formula, std::vector<int> &assignments) {
+bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, data &d) {
     // Stores the backtracking trail for the assignments
     std::vector<int> trail;
     std::vector<int> assignment_level(formula.num_variables + 1);
@@ -309,12 +398,10 @@ bool CDCL(CNF &formula, std::vector<int> &assignments) {
         assignment_reason[i] = -2;
     }
 
-    int debug = 0; // DEBUG
-
     int guess_level = 0;  // Stores the guess level of the current propagation
 
     while (true) {
-        int status = unitPropagation(formula, assignments, trail, assignment_level, assignment_reason, guess_level);
+        int status = unitPropagation(formula, assignments, trail, assignment_level, assignment_reason, guess_level, d);
 
         // Critical error encountered
         if(status == -1) return false;
@@ -322,55 +409,23 @@ bool CDCL(CNF &formula, std::vector<int> &assignments) {
         // Unit propagation detects an unsat
         if(status == 1) return false;
 
-        // Base Case 1: All clauses were satisfied
-        // Base Case 2: An empty clause means this branch failed (should never run into in practice)
-        // TODO: Stick into unit propagation instead?
-        bool sat = true;
-        bool unsat = false;
-        for (const auto& clause : formula.clauses) {
-            bool empty = true;
-            bool flag = false;
-            for(int x : clause) {
-                int value = assignments[std::abs(x)];
-                int polarity = x > 0 ? 1 : -1;
-                
-                // Checks to see if there is an empty (unsat) clause. Drops flag if it finds a term that is satisfied or unassigned.
-                if(empty && (value == 0 || value == polarity)) empty = false;
-
-                // Checks to see if there is at least one satisfied literal
-                if(sat && !flag && value == polarity) flag = true;
-            }
-
-            if(empty) {
-                unsat = true;
-                break;
-            }
-
-            if(sat && !flag) sat = false;
-        }
-
-        // Checks unsat first, then sat
-        if(unsat) return false;
-        if(sat) return true;
+        // Unit propagation detects a fully satisfied CNF
+        if(status == 2) return true;
 
         // Heuristics
-        int lit = chooseLiteral(formula, assignments);
+        int lit = chooseLiteral(formula, assignments, H_MODE);
         if(lit == 0) { // Cannot find a literal
             std::cout << "ERROR: Cannot find unassigned literal" << std::endl;
             return false;
         }
         guess_level++;
+        d.num_decisions++;
 
         int index = std::abs(lit);
         assignments[index] = lit > 0 ? 1 : -1;
         trail.push_back(index);
         assignment_level[index] = guess_level;
         assignment_reason[index] = -1;
-
-        // // DEBUG
-        // printCNF(formula);
-        // debug++;
-        // if(debug == 20) return false;
     }
     // If the loop somehow exits, return false (this should never happen)
     return false;
@@ -483,19 +538,20 @@ CNF reformat(const CNF formula, std::vector<int> &key) {
     return newFormula;
 }
 
-// Command for generating cdcl.exe: g++ -o dpll DPLL.cpp
+// Command for generating cdcl.exe: g++ -o cdcl_v2 CDCL_V2.cpp
 // Command for running program: ./cdcl "[X]", where X is the name of the file location of the dataset.
 int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
-    if (argc != 2 && argc != 3) {
-        std::cout << "Usage: ./dpll_cpp <benchmark_folder> [output_csv]" << std::endl;
-        std::cout << "Example: ./dpll_cpp benchmarks/uf50-218 dpll_cpp_uf50_1000.csv" << std::endl;
-        std::cout << "Example: ./dpll_cpp benchmarks/uuf50-218 dpll_cpp_uuf50_1000.csv" << std::endl;
+    if (argc != 2 && argc != 3 && argc != 4) {
+        std::cout << "Usage: ./cdcl_v2 <benchmark_folder> [output_csv] [heuristic_mode]" << std::endl;
+        std::cout << "Example: ./cdcl_v2 benchmarks/uf50-218 cdcl_v2_cpp_uf50_1000.csv 0" << std::endl;
+        std::cout << "Example: ./cdcl_v2 benchmarks/uuf50-218 cdcl_v2_cpp_uuf50_1000.csv 0" << std::endl;
         return 1;
     }
 
     std::string benchmarkFolder = argv[1];
 
     bool writeCSV = (argc == 3);
+    int heuristic_mode = (argc == 4 ? std::atoi(argv[3]) : 0);
     std::ofstream csv;
 
     if (writeCSV) {
@@ -526,6 +582,11 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
     double maxTime = 0.0;
     double totalTime = 0.0;
 
+    int totalDecisions = 0;
+    int totalAssignments = 0;
+    int totalBacktrack = 0;
+    int totalResolutions = 0;
+
     for (const auto& filePath : files) {
         std::string filename = filePath.string();
 
@@ -533,11 +594,12 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
 
         std::vector<int> key;
         CNF reformat_formula = reformat(formula, key);
+        data d;
 
         auto start = std::chrono::high_resolution_clock::now();
 
         std::vector<int> assignments(reformat_formula.num_variables + 1);
-        bool verdict = CDCL(reformat_formula, assignments);
+        bool verdict = CDCL(reformat_formula, assignments, heuristic_mode, d);
 
         auto end = std::chrono::high_resolution_clock::now();
 
@@ -563,6 +625,11 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
             unsatCount++;
         }
 
+        totalDecisions += d.num_decisions;
+        totalAssignments += d.num_assignments;
+        totalBacktrack += d.num_backtrack;
+        totalResolutions += d.num_resolutions;
+
         if (writeCSV) {
             csv << filename << ","
                 << elapsed_seconds << ","
@@ -570,9 +637,6 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
         }
 
         std::cout << filename << "," << elapsed_seconds << "," << verdictString << std::endl;
-
-        // // DEBUG
-        // if(verdict == false) break;
     }
 
     if (writeCSV) {
@@ -586,6 +650,12 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
     std::cout << "min time: " << minTime << std::endl;
     std::cout << "max time: " << maxTime << std::endl;
     std::cout << "avg time: " << avgTime << std::endl;
+
+    std::cout << std::endl;
+    std::cout << "avg decisions: " << 1.0 * totalDecisions / numSolved << std::endl;
+    std::cout << "avg assignments: " << 1.0 * totalAssignments / numSolved << std::endl;
+    std::cout << "avg backtracks: " << 1.0 * totalBacktrack / numSolved << std::endl;
+    std::cout << "avg resolutions: " << 1.0 * totalResolutions / numSolved << std::endl;
 
     std::cout << std::endl;
     std::cout << "SAT count: " << satCount << std::endl;
