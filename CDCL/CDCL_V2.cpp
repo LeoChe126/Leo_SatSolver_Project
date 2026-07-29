@@ -9,6 +9,7 @@
  *      Added tracking for various data points using a new struct
  *      Integrated the base case conditions for the main loop into the unit propagation
  *      Added a mode switcher for heuristics and added 2 new heuristics
+ *      Updated a lot of comments
  */
 
 /* General comments:
@@ -244,7 +245,7 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
                 int value = assignments[std::abs(x)];
 
                 // If the clause is already satisfied 
-                // TODO: Could be optimized to have a separate tracker for which clauses are already satisfied?
+                // TODO: Could have a separate tracker for which clauses are already satisfied?
                 // Apparently two-watched literals implements this idea but better.
                 if(value == (x > 0 ? 1 : -1)) {
                     sat = true;
@@ -327,17 +328,27 @@ int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const
             return 0;
         }
 
-        case 1: { // Highest unassigned literal frequency (unsigned, always positive) TODO: Don't like how it creates a new vector each time. Better way of tracking?
+        case 1: { // Highest unassigned literal frequency (unsigned, biased towards more frequent polarity, positive if tied) 
+                  // TODO: Don't like how it creates a new vector each time. Better way of tracking?
             int lit = 0;
             int maxCount = 0;
-            std::vector<int> counts(formula.num_variables + 1);
+            std::vector<int> posCounts(formula.num_variables + 1);
+            std::vector<int> negCounts(formula.num_variables + 1);
             for(const auto &clause : formula.clauses) {
                 for(int x : clause) {
+                    if(assignments[std::abs(x)] != 0) continue;
                     int l = std::abs(x);
-                    if(assignments[l] != 0) continue;
-                    int c = ++counts[l];
+
+                    if(x > 0) {
+                        posCounts[l]++;
+                    } else {
+                        negCounts[l]++;
+                    }
+
+                    int c = posCounts[l] + negCounts[l];
+
                     if(c > maxCount) {
-                        lit = l;
+                        lit = (posCounts[l] >= negCounts[l] ? l : -l);
                         maxCount = c;
                     }
                 }
