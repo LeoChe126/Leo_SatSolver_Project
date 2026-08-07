@@ -3,6 +3,7 @@
  
 import sys
 import time
+import os
  
  
 # DIMACS CNF parsing
@@ -69,7 +70,7 @@ def simplify(clauses, lit):
     return new
  
  
-def dpll(clauses, assignment):
+def dpll(clauses, assignment, stats):
     # Return a satisfying assignment dict {var: bool}, or None if UNSAT.
 
     #Unit propagation: repeatedly assign forced literals
@@ -77,12 +78,15 @@ def dpll(clauses, assignment):
         unit = None
         for c in clauses:
             if len(c) == 0:
+                stats["conflicts"] += 1
                 return None # empty clause = conflict = UNSAT here
             if len(c) == 1:
                 unit = c[0]
                 break
         if unit is None:
             break
+        
+        stats["propagations"] += 1
         assignment[abs(unit)] = (unit > 0)
         clauses = simplify(clauses, unit)
  
@@ -101,14 +105,16 @@ def dpll(clauses, assignment):
         return assignment
     for c in clauses: 
         if len(c) == 0: #empty clause -> UNSAT
+            stats["conflicts"] += 1
             return None #backtrack and try another assignment 
  
     # Decision: pick a literal and branch 
     lit = clauses[0][0] # pick first literal, could be improved with heuristics!!!!
+    stats["decisions"] += 1 # DPLL reached a point where it had to guess.
     for guess in (lit, -lit):
         a = dict(assignment) #copy of current assignment
         a[abs(guess)] = (guess > 0)
-        res = dpll(simplify(clauses, guess), a)
+        res = dpll(simplify(clauses, guess), a, stats)
         if res is not None: 
             return res
     return None
@@ -132,30 +138,116 @@ def verify(clauses, assignment):
 def solve_text(text):
     num_vars, clauses = parseFile(text)
     t0 = time.perf_counter()
-    result = dpll([c[:] for c in clauses], {}) #first argument makes a copy of all clauses, second argument is empty assignment at first 
+    stats = {
+        "decisions": 0,
+        "conflicts": 0,
+        "propagations": 0,
+        #"learned_clauses": 0
+    }
+    result = dpll([c[:] for c in clauses], {}, stats) #first argument makes a copy of all clauses, second argument is empty assignment at first 
     elapsed = time.perf_counter() - t0
  
     if result is None:
-        return "UNSAT", None, elapsed, num_vars, len(clauses)
+        return "UNSAT", None, elapsed, num_vars, len(clauses), stats
  
     # Fill in any free variables so we hand back a complete model.
     for v in range(1, num_vars + 1):
         result.setdefault(v, True)
     assert verify(clauses, result), "BUG: returned a non-satisfying model!"
-    return "SAT", result, elapsed, num_vars, len(clauses)
+    return "SAT", result, elapsed, num_vars, len(clauses), stats
  
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python DPLL/dpll.py benchmarks/../xx.cnf")
+        print("Usage:")
+        print("  python3 DPLL/dpll.py <cnf_file>")
+        print("  python3 DPLL/dpll.py <benchmark_folder>")
         return
-    with open(sys.argv[1]) as f:
-        verdict, model, elapsed, nv, nc = solve_text(f.read())
-    print(f"c file: {sys.argv[1]}  ({nv} vars, {nc} clauses)")
-    print(f"c time: {elapsed:.4f} s")
-    print("s " + ("SATISFIABLE" if verdict == "SAT" else "UNSATISFIABLE"))
-    if model is not None:                        # DIMACS-style model line
-        lits = [str(v if model[v] else -v) for v in sorted(model)]
-        print("v " + " ".join(lits) + " 0")
+
+    path = sys.argv[1]
+    
+    # Case 1: user gave one CNF file
+    if os.path.isfile(path):
+        with open(path) as f:
+            verdict, model, elapsed, nv, nc, stats = solve_text(f.read())
+
+        print(f"c file: {path}  ({nv} vars, {nc} clauses)")
+        print(f"c time: {elapsed:.4f} s")
+        print(f"c decisions: {stats['decisions']}")
+        print(f"c conflicts: {stats['conflicts']}")
+        print(f"c propagations: {stats['propagations']}")
+        print("s " + ("SATISFIABLE" if verdict == "SAT" else "UNSATISFIABLE"))
+
+        if model is not None:
+            lits = [str(v if model[v] else -v) for v in sorted(model)]
+            print("v " + " ".join(lits) + " 0")
+
+        return
+
+    # Case 2: user gave a benchmark folder
+    if os.path.isdir(path):
+        files = []
+
+        for filename in os.listdir(path):
+            if filename.endswith(".cnf"):
+                files.append(os.path.join(path, filename))
+
+        files.sort()
+
+        if not files:
+            print(f"No .cnf files found in folder: {path}")
+            return
+
+        times = []
+        decision_counts = []
+        conflict_counts = []
+        propagation_counts = []
+
+        sat_count = 0
+        unsat_count = 0
+
+        print(f"Benchmark folder: {path}")
+        print(f"Found {len(files)} CNF files.")
+        print()
+
+        for filepath in files:
+            with open(filepath) as f:
+                verdict, model, elapsed, nv, nc, stats = solve_text(f.read())
+
+            times.append(elapsed)
+            decision_counts.append(stats["decisions"])
+            conflict_counts.append(stats["conflicts"])
+            propagation_counts.append(stats["propagations"])
+
+            if verdict == "SAT":
+                sat_count += 1
+                verdict_str = "SATISFIABLE"
+            else:
+                unsat_count += 1
+                verdict_str = "UNSATISFIABLE"
+
+            print(
+                f"{filepath},{elapsed},{verdict_str},"
+                f"{stats['decisions']},"
+                f"{stats['conflicts']},"
+                f"{stats['propagations']}"
+            )
+
+        print()
+        print(f"num solved: {len(files)}")
+        print(f"min time: {min(times)}")
+        print(f"max time: {max(times)}")
+        print(f"avg time: {sum(times) / len(times)}")
+        print()
+        print(f"avg decisions: {sum(decision_counts) / len(decision_counts)}")
+        print(f"avg conflicts: {sum(conflict_counts) / len(conflict_counts)}")
+        print(f"avg propagations: {sum(propagation_counts) / len(propagation_counts)}")
+        print()
+        print(f"SAT count: {sat_count}")
+        print(f"UNSAT count: {unsat_count}")
+
+        return
+
+    print(f"ERROR: path does not exist: {path}")
  
  
 if __name__ == "__main__":
