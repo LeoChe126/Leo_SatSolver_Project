@@ -10,6 +10,10 @@
  *      Integrated the base case conditions for the main loop into the unit propagation
  *      Added a mode switcher for heuristics and added 2 new heuristics
  *      Updated a lot of comments
+ * Version 2.2 changes:
+ *      Made the assignments vector also store previous assignments using 2 and -2.
+ *      Added a new heuristic which is a variant of highest unsigned freqeuncy. It uses the previous assignment if possible, otherwise identical to the original heuristic.
+ *      Implemented VSIDS as a heuristic
  */
 
 /* General comments:
@@ -17,7 +21,7 @@
  * Example 1: The literal "1" would have its value stored at assignment[1] and its trail level at assignment_level[1].
  * Example 2: The literal "-3" would have its value stored at assignment[3] and its trail level at assignment_level[3].
  * 
- * For the assignments, "0" indicates that the literal is unassigned while 1/-1 represents true/false respectively.
+ * For the assignments, "0" indicates that the literal is unassigned while 1/-1 represents true/false respectively. 2/-2 are also unassigned, but store the last assignment used.
  * For the assignment levels, the value indicates the level. Has a default value of -1.
  * For the assignment reasons, the value indicates the clause index that resulted in the assignment. Has a default value of -2.
  * A value of -1 instead indicates that the assignment was from a decision.
@@ -54,6 +58,34 @@ struct data {
     int num_resolutions = 0;  // Total number of resolution clauses added
 };
 
+struct VSIDS { // TODO: Use a variable heap?
+    double increment = 0.5;
+    uint32_t num_increments = 0;
+
+    const double INIT_VALUE = 1;
+    const double RATIO = 1.2;
+    const uint32_t RESCALE = 1250; // Calculated using default increment of 0.5 and ratio of 1.2. Such a value results in a maximum value of approximately 10^100
+    const double RESCALE_RATIO = std::pow(10, 100);
+
+    std::vector<double> weight; // Vector that holds the weights of literals
+    std::vector<bool> seen;      // Helper vector for keeping track of which literals to update in weights
+};
+
+VSIDS initVSIDS(int n) {
+    VSIDS V;
+    std::vector<double> &w = V.weight;
+    std::vector<bool> &s = V.seen;
+
+    w.push_back(0); // Dummy value at index 0
+    s.push_back(false);
+    for(int i = 1; i <= n; i++) {
+        w.push_back(V.INIT_VALUE);
+        s.push_back(false);
+    }
+
+    return V;
+}
+
 // Function for debugging
 void printCNF(const CNF &formula) {
     for(int i = 0; i < formula.num_clauses; i++) {
@@ -86,13 +118,22 @@ void printCNF(const CNF &formula) {
  *          1: Unresolvable conflict is detected, should exit immediately.
  */
 int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int> &trail, 
-    std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, int conflictIndex, data &d) {
+    std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, int conflictIndex, VSIDS &V, data &d) {
 
     // Resolution clause
     std::vector<int> resolution = formula.clauses[conflictIndex];
     int count = 0;
-    for(int x : resolution) {
-        if(assignment_level[std::abs(x)] == guess_level) count++;
+
+    std::vector<int> updateVSIDS; // V2.2
+    for(int i = 0; i < resolution.size(); i++) {
+        int index = std::abs(resolution[i]);
+        if(assignment_level[index] == guess_level) count++;\
+
+        // V2.2
+        if(V.seen[index] == false) {
+            V.seen[index] = true;
+            updateVSIDS.push_back(index);
+        }
     }
 
     while(count > 1) {
@@ -132,8 +173,16 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
             }
         }
 
+        // Merges with the reason clause
         for(int x : reasonClause) {
             if((x != latest_lit && x != -latest_lit) && (std::find(resolution.begin(), resolution.end(), x) == resolution.end())) resolution.push_back(x);
+
+            // V2.2
+            int i = std::abs(x);
+            if(V.seen[i] == false) { // V2.2
+                V.seen[i] = true;
+                updateVSIDS.push_back(i);
+            }
         }
 
         // Recounts number of literals at current guess level
@@ -178,7 +227,7 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
             
             if(tl <= target_level) break;
 
-            assignments[var] = 0;
+            assignments[var] = assignments[var] > 0 ? 2 : -2; // V2.2: Now resets to 2/-2 depending on previous assignment
             trail.pop_back();
             assignment_level[var] = -1;
             assignment_reason[var] = -2;
@@ -200,6 +249,32 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
         d.num_resolutions++;
 
         guess_level = target_level;
+
+        // V2.2: Updates VSIDS parameters after resolution
+        if(V.num_increments >= V.RESCALE) { // Safety for overflow (extremely unlikely to occur)
+            V.increment /= V.RESCALE_RATIO;
+            for(int i = 0; i < V.weight.size(); i++) { 
+                V.weight[i] /= V.RESCALE_RATIO;
+            }
+            V.num_increments = 0;
+        }
+
+        for(int x : updateVSIDS) {
+            V.weight[x] += V.increment;
+            V.seen[x] = false;
+        }
+        V.num_increments++;
+        V.increment *= V.RATIO;
+
+        // DEBUG
+        std::cout << "[";
+        for(int i = 1; i <= V.weight.size(); i++) {
+            std::cout << V.weight[i];
+            if(i != V.weight.size()) {
+                 std::cout  << ", ";
+            }
+        }
+        std::cout << "]" << std::endl;
 
         // Conflict resolution complete
         return 0;
@@ -228,7 +303,8 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
  *      Note: Any modifications made as part of an incomplete unit propagation should be undone when doing conflict resolution.
  */
 int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int> &trail,
-    std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, data &d) {
+    std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, 
+    VSIDS &V, data &d) {
 
     // Unit Propagation
     while(true) {
@@ -253,7 +329,7 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
                 }
 
                 // Stores the unassigned literal and increments count (no purpose in keeping track of more literals past 1)
-                if(count < 2 && value == 0) {
+                if(count < 2 && (value != -1 && value != 1)) { // V2.2: Right condition originally checked value == 0
                     count++;
                     lit = x;
                 }
@@ -263,7 +339,7 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
 
             // Unsatisfiable clause found, need to perform conflict resolution
             if(count == 0) {
-                int status = resolveConflict(formula, assignments, trail, assignment_level, assignment_reason, guess_level, i, d);
+                int status = resolveConflict(formula, assignments, trail, assignment_level, assignment_reason, guess_level, i, V, d);
 
                 // If conflict is successfully resolved, tries propagation again.
                 if(status == 0) {
@@ -317,12 +393,13 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
  *      1: Highest unassigned unsigned literal frequency. Always returns a positive literal.
  *      2: Highest unassigned signed literal frequency.
  */
-int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const int H_MODE) {
+int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const int H_MODE, VSIDS &V) {
     switch(H_MODE) {
         case 0: { // Simple naive heuristic
             for(const auto &clause : formula.clauses) {
                 for(int x : clause) {
-                    if(assignments[std::abs(x)] == 0) return x;
+                    int value = assignments[std::abs(x)];
+                    if(value != -1 && value != 1) return x; // V2.2: Condition originally only checked for value == 0
                 }  
             }
             return 0;
@@ -336,7 +413,8 @@ int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const
             std::vector<int> negCounts(formula.num_variables + 1);
             for(const auto &clause : formula.clauses) {
                 for(int x : clause) {
-                    if(assignments[std::abs(x)] != 0) continue;
+                    int value = assignments[std::abs(x)];
+                    if(value == -1 || value == 1) continue; // V2.2: Condition originally only checked for value == 0
                     int l = std::abs(x);
 
                     if(x > 0) {
@@ -363,7 +441,8 @@ int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const
             std::vector<int> negCounts(formula.num_variables + 1);
             for(const auto &clause : formula.clauses) {
                 for(int x : clause) {
-                    if(assignments[std::abs(x)] != 0) continue;
+                    int value = assignments[std::abs(x)];
+                    if(value == -1 || value == 1) continue; // V2.2: Condition originally only checked for value == 0
                     int c;
 
                     if(x > 0) {
@@ -381,6 +460,62 @@ int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const
             return lit;
         }
 
+        case 3: { // Highest unassigned literal frequency (unsigned, uses previous assignment if available, biased towards more frequent polarity, positive if tied) 
+                  // TODO: Same issue as mode 1
+            int lit = 0;
+            int maxCount = 0;
+            std::vector<int> posCounts(formula.num_variables + 1);
+            std::vector<int> negCounts(formula.num_variables + 1);
+            for(const auto &clause : formula.clauses) {
+                for(int x : clause) {
+                    int value = assignments[std::abs(x)];
+                    if(value == -1 || value == 1) continue; // V2.2: Condition originally only checked for value == 0
+                    int l = std::abs(x);
+
+                    if(x > 0) {
+                        posCounts[l]++;
+                    } else {
+                        negCounts[l]++;
+                    }
+
+                    int c = posCounts[l] + negCounts[l];
+
+                    if(c > maxCount) {
+                        lit = (posCounts[l] >= negCounts[l] ? l : -l);
+                        maxCount = c;
+                    }
+                }
+            }
+
+            int prev = assignments[std::abs(lit)];
+            if(prev == -2 || prev == 2) {
+                return (prev > 0 ? std::abs(lit) : -std::abs(lit));
+            }
+            return lit;
+        }
+
+        case 4: { // VSIDS, uses default value of positive polarity
+            int lit = 0;
+            double maxWeight = -1.0;
+
+            for(int i = 1; i <= formula.num_variables; i++) {
+                int value = assignments[i];
+                if(value != -1 && value != 1) {
+                    double currentWeight = V.weight[i];
+                    if(currentWeight > maxWeight) {
+                        maxWeight = currentWeight;
+                        if(value == 0) {
+                            lit = i;
+                        } else {
+                            lit = (value > 0 ? i : -i);
+                        }
+                    }
+                }
+            }
+
+            return lit;
+        }
+
         default:
             std::cout << "ERROR: Unknown heuristic mode chosen" << std::endl;
             break;
@@ -393,12 +528,12 @@ int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const
 /* Runs the CDCL algorithm (but with a loop instead)
  * Inputs:
  *      formula: Takes the initial CNF that has literals from 1 to num_variables.
- *      assignments: Holds the assignments.\
+ *      assignments: Holds the assignments.
  *      d: Stores the tracking data
  * Output:
  *      Returns the verdict.
  */
-bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, data &d) {
+bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, VSIDS &V, data &d) {
     // Stores the backtracking trail for the assignments
     std::vector<int> trail;
     std::vector<int> assignment_level(formula.num_variables + 1);
@@ -412,7 +547,7 @@ bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, data &d
     int guess_level = 0;  // Stores the guess level of the current propagation
 
     while (true) {
-        int status = unitPropagation(formula, assignments, trail, assignment_level, assignment_reason, guess_level, d);
+        int status = unitPropagation(formula, assignments, trail, assignment_level, assignment_reason, guess_level, V, d);
 
         // Critical error encountered
         if(status == -1) return false;
@@ -424,7 +559,7 @@ bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, data &d
         if(status == 2) return true;
 
         // Heuristics
-        int lit = chooseLiteral(formula, assignments, H_MODE);
+        int lit = chooseLiteral(formula, assignments, H_MODE, V);
         if(lit == 0) { // Cannot find a literal
             std::cout << "ERROR: Cannot find unassigned literal" << std::endl;
             return false;
@@ -598,6 +733,8 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
     int totalBacktrack = 0;
     int totalResolutions = 0;
 
+    const int NUM_FILES = 10;
+
     for (const auto& filePath : files) {
         std::string filename = filePath.string();
 
@@ -606,11 +743,12 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
         std::vector<int> key;
         CNF reformat_formula = reformat(formula, key);
         data d;
+        VSIDS V = initVSIDS(reformat_formula.num_variables);
 
         auto start = std::chrono::high_resolution_clock::now();
 
         std::vector<int> assignments(reformat_formula.num_variables + 1);
-        bool verdict = CDCL(reformat_formula, assignments, heuristic_mode, d);
+        bool verdict = CDCL(reformat_formula, assignments, heuristic_mode, V, d);
 
         auto end = std::chrono::high_resolution_clock::now();
 
@@ -648,6 +786,8 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
         }
 
         std::cout << filename << "," << elapsed_seconds << "," << verdictString << std::endl;
+
+        if(numSolved != -1 && numSolved >= NUM_FILES) break;
     }
 
     if (writeCSV) {
