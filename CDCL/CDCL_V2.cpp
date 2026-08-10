@@ -62,24 +62,36 @@ struct VSIDS { // TODO: Use a variable heap?
     double increment = 0.5;
     uint32_t num_increments = 0;
 
-    const double INIT_VALUE = 1;
     const double RATIO = 1.2;
     const uint32_t RESCALE = 1250; // Calculated using default increment of 0.5 and ratio of 1.2. Such a value results in a maximum value of approximately 10^100
     const double RESCALE_RATIO = std::pow(10, 100);
 
     std::vector<double> weight; // Vector that holds the weights of literals
-    std::vector<bool> seen;      // Helper vector for keeping track of which literals to update in weights
+    std::vector<bool> seen;     // Helper vector for keeping track of which literals to update in weights
 };
 
-VSIDS initVSIDS(int n) {
+VSIDS initVSIDS(CNF formula) {
     VSIDS V;
     std::vector<double> &w = V.weight;
     std::vector<bool> &s = V.seen;
 
-    w.push_back(0); // Dummy value at index 0
+    // Dummy values at index 0
+    w.push_back(0);
     s.push_back(false);
-    for(int i = 1; i <= n; i++) {
-        w.push_back(V.INIT_VALUE);
+
+    // Initialize weights to the unsigned frequency of literals
+    // TODO: Mess around with the initial values, maybe try Jeruslow-Wang score?
+    for(int i = 1; i <= formula.num_variables; i++) {
+        int n = 0;
+        for(const auto &clause : formula.clauses) {
+            for(int x : clause) {
+                if(x == i || x == -i) {
+                    n++;
+                    break;
+                }
+            }
+        }
+        w.push_back(n);
         s.push_back(false);
     }
 
@@ -268,9 +280,9 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
 
         // DEBUG
         std::cout << "[";
-        for(int i = 1; i <= V.weight.size(); i++) {
+        for(int i = 1; i < V.weight.size(); i++) {
             std::cout << V.weight[i];
-            if(i != V.weight.size()) {
+            if(i != V.weight.size() - 1) {
                  std::cout  << ", ";
             }
         }
@@ -743,7 +755,7 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
         std::vector<int> key;
         CNF reformat_formula = reformat(formula, key);
         data d;
-        VSIDS V = initVSIDS(reformat_formula.num_variables);
+        VSIDS V = initVSIDS(reformat_formula);
 
         auto start = std::chrono::high_resolution_clock::now();
 
