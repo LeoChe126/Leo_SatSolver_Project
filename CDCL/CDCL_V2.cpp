@@ -258,7 +258,6 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
         trail.push_back(index);
         assignment_level[index] = target_level;
         assignment_reason[index] = formula.num_clauses - 1; // New resolution clause should be the one at the very back
-        d.num_resolutions++;
 
         guess_level = target_level;
 
@@ -277,16 +276,6 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
         }
         V.num_increments++;
         V.increment *= V.RATIO;
-
-        // DEBUG
-        std::cout << "[";
-        for(int i = 1; i < V.weight.size(); i++) {
-            std::cout << V.weight[i];
-            if(i != V.weight.size() - 1) {
-                 std::cout  << ", ";
-            }
-        }
-        std::cout << "]" << std::endl;
 
         // Conflict resolution complete
         return 0;
@@ -404,6 +393,8 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
  *      0: Simple naive heuristic, chooses first unassigned literal found
  *      1: Highest unassigned unsigned literal frequency. Always returns a positive literal.
  *      2: Highest unassigned signed literal frequency.
+ *      3: Highest unassigned unsigned literal frequency. Uses previous assignment if available. Otherwise, chooses the polarity with higher frequency.
+ *      4: VSIDS with a default positive polarity if not previously assigned.
  */
 int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const int H_MODE, VSIDS &V) {
     switch(H_MODE) {
@@ -517,7 +508,7 @@ int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const
                     if(currentWeight > maxWeight) {
                         maxWeight = currentWeight;
                         if(value == 0) {
-                            lit = i;
+                            lit = -i;
                         } else {
                             lit = (value > 0 ? i : -i);
                         }
@@ -696,6 +687,35 @@ CNF reformat(const CNF formula, std::vector<int> &key) {
     return newFormula;
 }
 
+// Prints the assignments, properly converted back into their original form.
+void printAssignments(const std::vector<int> &assignments, const std::vector<int> &key) {
+    std::cout << "Assignments:" << std::endl;
+    for(int i = 1; i < assignments.size(); i++) {
+        std::cout << key[i - 1] << ": " << assignments[i] << std::endl;
+    }
+}
+
+// Verifies the assignments validity.
+bool verifyAssignments(const CNF &formula, const std::vector<int> &assignments, int num_clauses) {
+    for(int i = 0; i < num_clauses; i++) {
+        bool flag = false;
+        const std::vector<int> &clause = formula.clauses[i];
+
+        for(int j = 0; j < clause.size(); j++) {
+            int lit = clause[j];
+            int value = assignments[std::abs(lit)];
+            if(value == (lit > 0 ? 1 : -1)) {
+                flag = true;
+                break;
+            }
+        }
+
+        if(!flag) return false;
+    }
+
+    return true;
+}
+
 // Command for generating cdcl.exe: g++ -o cdcl_v2 CDCL_V2.cpp
 // Command for running program: ./cdcl "[X]", where X is the name of the file location of the dataset.
 int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
@@ -798,6 +818,10 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
         }
 
         std::cout << filename << "," << elapsed_seconds << "," << verdictString << std::endl;
+        
+        // DEBUG
+        // std::cout << "Assignment validity: " << verifyAssignments(reformat_formula, assignments, formula.num_clauses) << std::endl;
+        // printAssignments(assignments, key);
 
         if(numSolved != -1 && numSolved >= NUM_FILES) break;
     }
