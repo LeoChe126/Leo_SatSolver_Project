@@ -53,7 +53,8 @@ struct CNF {
 
 struct data {
     int num_decisions = 0;    // Total number of decisions made by heuristic
-    int num_assignments = 0;  // Total number of unit propagation assignments
+    int num_assignments = 0;  // Total number of assignments
+    int num_propagations = 0; // Total number of unit propgations
     int num_backtrack = 0;    // Total number of guess levels backtracked
     int num_resolutions = 0;  // Total number of resolution clauses added
 };
@@ -311,6 +312,8 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
     while(true) {
         bool allSat = true;
         bool flag = true;
+        d.num_propagations++;
+
         for(int i = 0; i < formula.num_clauses; i++) {
             // Various flags to check the status of the clause.
             bool sat = false;
@@ -508,7 +511,7 @@ int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const
                     if(currentWeight > maxWeight) {
                         maxWeight = currentWeight;
                         if(value == 0) {
-                            lit = -i;
+                            lit = i;
                         } else {
                             lit = (value > 0 ? i : -i);
                         }
@@ -762,10 +765,11 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
 
     int totalDecisions = 0;
     int totalAssignments = 0;
+    int totalPropagations = 0;
     int totalBacktrack = 0;
     int totalResolutions = 0;
 
-    const int NUM_FILES = 10;
+    const int NUM_FILES = 1000;
 
     for (const auto& filePath : files) {
         std::string filename = filePath.string();
@@ -808,6 +812,7 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
 
         totalDecisions += d.num_decisions;
         totalAssignments += d.num_assignments;
+        totalPropagations += d.num_propagations;
         totalBacktrack += d.num_backtrack;
         totalResolutions += d.num_resolutions;
 
@@ -841,6 +846,7 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
     std::cout << std::endl;
     std::cout << "avg decisions: " << 1.0 * totalDecisions / numSolved << std::endl;
     std::cout << "avg assignments: " << 1.0 * totalAssignments / numSolved << std::endl;
+    std::cout << "avg propgations: " << 1.0 * totalPropagations / numSolved << std::endl;
     std::cout << "avg backtracks: " << 1.0 * totalBacktrack / numSolved << std::endl;
     std::cout << "avg resolutions: " << 1.0 * totalResolutions / numSolved << std::endl;
 
