@@ -14,6 +14,8 @@
  *      Made the assignments vector also store previous assignments using 2 and -2.
  *      Added a new heuristic which is a variant of highest unsigned freqeuncy. It uses the previous assignment if possible, otherwise identical to the original heuristic.
  *      Implemented VSIDS as a heuristic
+ * Version 2.3 changes:
+ *      Created a tracker for clause deletion using activity scores (similar to VSIDS)
  */
 
 /* General comments:
@@ -23,11 +25,17 @@
  * 
  * For the assignments, "0" indicates that the literal is unassigned while 1/-1 represents true/false respectively. 2/-2 are also unassigned, but store the last assignment used.
  * For the assignment levels, the value indicates the level. Has a default value of -1.
- * For the assignment reasons, the value indicates the clause index that resulted in the assignment. Has a default value of -2.
+ * For the assignment reasons, the value indicates the clause index that resulted in the assignment. Has a default value of -2 and uses -1 for any decision.
  * A value of -1 instead indicates that the assignment was from a decision.
  * 
  * For the trail, the backtracking is stored chronologically with the most recent changes being at the back of the vector.
  * The trail stores the literals that were assigned at certain times and may be undone by going from back to front.
+ * 
+ * 
+ * Notes about "tricks":
+ * 
+ * VSIDS: Considered to have worse decision quality in exchange for much less overhead. However, hard to parallelize
+ * 
  */
 
 // File parsing
@@ -56,14 +64,13 @@ struct data {
     int num_assignments = 0;  // Total number of unit propagation assignments
     int num_backtrack = 0;    // Total number of guess levels backtracked
     int num_resolutions = 0;  // Total number of resolution clauses added
+    int num_culls = 0;        // Total number of resolution clauses culled
 };
 
 struct VSIDS { // TODO: Use a variable heap?
     double increment = 0.5;
-    uint32_t num_increments = 0;
 
     const double RATIO = 1.2;
-    const uint32_t RESCALE = 1250; // Calculated using default increment of 0.5 and ratio of 1.2. Such a value results in a maximum value of approximately 10^100
     const double RESCALE_RATIO = std::pow(10, 100);
 
     std::vector<double> weight; // Vector that holds the weights of literals
@@ -98,6 +105,18 @@ VSIDS initVSIDS(CNF formula) {
     return V;
 }
 
+struct clauseActivity {
+    double increment = 0.5;
+    int num_clauses; // Stores the number of clauses that the CNF originally started with
+
+    const double RATIO = 1.001;
+    const double RESCALE_RATIO = std::pow(10, 20);
+    const int THRESHOLD_INIT = 5;
+    const int THRESHOLD_RATIO = 2;
+
+    std::vector<double> activity; // Vector that holds the activity of clauses
+};
+
 // Function for debugging
 void printCNF(const CNF &formula) {
     for(int i = 0; i < formula.num_clauses; i++) {
@@ -122,7 +141,7 @@ void printCNF(const CNF &formula) {
  *      assignment_reason: Holds the clause index for the reason for corresponding assignments. -1 for any decisions.
  *      guess_level: The guess level of the current state.
  *      conflictIndex: The index of the clause that causes the conflict.
- *      d: Stores the tracking data
+ *      d: Tracks data
  * Output:
  *      Returns the status of conflict resolution:
  *          -1: Critical error of some sort, fails and executes program immediately.
@@ -130,7 +149,8 @@ void printCNF(const CNF &formula) {
  *          1: Unresolvable conflict is detected, should exit immediately.
  */
 int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int> &trail, 
-    std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, int conflictIndex, VSIDS &V, data &d) {
+    std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, 
+    int conflictIndex, VSIDS &V, clauseActivity &CA, data &d) {
 
     // Resolution clause
     std::vector<int> resolution = formula.clauses[conflictIndex];
@@ -173,7 +193,14 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
             return -1;
         }
 
-        const std::vector<int> &reasonClause = formula.clauses[assignment_reason[latest_lit]];
+        int reasonIndex = assignment_reason[latest_lit];
+        const std::vector<int> &reasonClause = formula.clauses[reasonIndex];
+
+        // V2.3: If the reason clause is a learned clause, then the appropriate activity is increased
+        if(reasonIndex >= CA.num_clauses) {
+            // Can assume that there is a value initialized because the activity is created whenever a new clause is added.
+            CA.activity[reasonIndex - CA.num_clauses] += CA.increment;
+        }
 
         // Deletes any instances of the latest assigned literal
         for(int i = 0; i < resolution.size(); i++) {
@@ -191,7 +218,7 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
 
             // V2.2
             int i = std::abs(x);
-            if(V.seen[i] == false) { // V2.2
+            if(V.seen[i] == false) {
                 V.seen[i] = true;
                 updateVSIDS.push_back(i);
             }
@@ -231,6 +258,9 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
         formula.num_clauses++;
         d.num_resolutions++;
 
+        // V2.3: Initializes activity value for new clause
+        CA.activity.push_back(CA.increment);
+
         // Backtracking
         while(!trail.empty()) {
             // Assume trail has only positive values.
@@ -262,20 +292,27 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
         guess_level = target_level;
 
         // V2.2: Updates VSIDS parameters after resolution
-        if(V.num_increments >= V.RESCALE) { // Safety for overflow (extremely unlikely to occur)
+        if(V.increment > V.RESCALE_RATIO) { // Safety for overflow
             V.increment /= V.RESCALE_RATIO;
             for(int i = 0; i < V.weight.size(); i++) { 
                 V.weight[i] /= V.RESCALE_RATIO;
             }
-            V.num_increments = 0;
         }
 
         for(int x : updateVSIDS) {
             V.weight[x] += V.increment;
             V.seen[x] = false;
         }
-        V.num_increments++;
         V.increment *= V.RATIO;
+
+        // V2.3: Update clause activity parameters after resolution
+        if(CA.increment >= CA.RESCALE_RATIO) { // Safety for overflow 
+            CA.increment /= CA.RESCALE_RATIO;
+            for(int i = 0; i < CA.activity.size(); i++) {
+                CA.activity[i] /= CA.RESCALE_RATIO;
+            }
+        }
+        CA.increment *= CA.RATIO;
 
         // Conflict resolution complete
         return 0;
@@ -305,7 +342,7 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
  */
 int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int> &trail,
     std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, 
-    VSIDS &V, data &d) {
+    VSIDS &V, clauseActivity &CA, data &d) {
 
     // Unit Propagation
     while(true) {
@@ -340,7 +377,7 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
 
             // Unsatisfiable clause found, need to perform conflict resolution
             if(count == 0) {
-                int status = resolveConflict(formula, assignments, trail, assignment_level, assignment_reason, guess_level, i, V, d);
+                int status = resolveConflict(formula, assignments, trail, assignment_level, assignment_reason, guess_level, i, V, CA, d);
 
                 // If conflict is successfully resolved, tries propagation again.
                 if(status == 0) {
@@ -381,9 +418,9 @@ int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int
     return 0;
 }
 
-/* Chooses a literal to guess (TODO: Implement better heuristics using variable ordering and initial state selection)
+/* Chooses a literal to guess
  * Inputs:
- *      formula: Takes the initial CNF that has literals from 1 to num_variables.
+ *      formula: Takes the CNF.
  *      assignments: Holds the assignments.
  *      d: Stores the tracking data
  * Output:
@@ -528,6 +565,131 @@ int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const
     return 0;
 }
 
+/* Culls resolution clauses based on culling mode. Does not consider binary/unit clauses or 
+ * clauses involved in current iteration.
+ * Inputs:
+ *      formula: Takes the CNF.
+ *      trail: Uses the trail to determine which literals have been modified recently.
+ *      assignment_reason: Uses the assignment reason and the trail to determine which clauses are part of the current trail. Updates if necessary.
+ *      d: Stores the tracking data.
+ * Output:
+ *      Returns an error message, 0 indicates normal operation.
+ * 
+ * Current Modes:
+ *      0: Default, does nothing.
+ *      1: Clause culling uses 
+ */
+int clauseCulling(CNF &formula, const std::vector<int> &trail, std::vector<int> &assignment_reason,
+    const int C_MODE, clauseActivity &CA, data &d) {
+    switch(C_MODE) {
+        case 0: { return 0; }
+        case 1: {
+            std::vector<int> candidates;
+            int base_num_clauses = CA.num_clauses; // Starting point for resolution clauses
+
+            // Select all non-binary and non-unit clauses
+            for(int i = base_num_clauses; i < formula.num_clauses; i++) {
+                if(formula.clauses[i].size() > 2) candidates.push_back(i);
+            }
+
+            std::cout << "Flag 1" << std::endl;
+
+            // Remove all clauses part of the trail
+            std::vector<int> used;
+            for(int x : trail) {
+                int val = assignment_reason[x];
+                // In theory, the trail should only contain assignment reasons of -1 (decision) or a nonnegative number (clause)
+                if(val != -2 && val != -1) {
+                    used.push_back(val);
+                }
+            }
+
+            std::cout << "Flag 2" << std::endl;
+
+            for(int i = 0; i < candidates.size(); i++) {
+                int index = std::find(used.begin(), used.end(), candidates[i]) - used.begin();
+                if(index != used.end() - used.begin()) {
+                    candidates[index] = candidates.back();
+                    candidates.pop_back();
+                    i--;
+                }
+            }
+
+            std::cout << "Flag 3" << std::endl;
+
+            // Extract activity values corresponding to the candidates vector
+            std::vector<int> activity;
+            for(int x : candidates) {
+                activity.push_back(CA.activity[x - base_num_clauses]);
+            }
+
+            std::cout << "Flag 4" << std::endl;
+
+            // Sort activities and corresponding clause indices to be ascending. Bottom half will be culled.
+            // TODO: Use a better sorting algorithm? Currently uses bubble sort
+            bool flag = true;
+            while(flag) {
+                flag = false;
+                for(int i = 0; i + 1 < activity.size(); i++) {
+                    if(activity[i] > activity[i + 1]) {
+                        int temp1 = candidates[i];
+                        double temp2 = activity[i];
+                        candidates[i] = candidates[i + 1];
+                        activity[i] = activity[i + 1];
+                        candidates[i + 1] = temp1;
+                        activity[i + 1] = temp2;
+                        flag = true;
+                    }
+                }
+            }
+
+            std::cout << "Flag 5" << std::endl;
+
+            // Cull bottom half of resolution clauses
+            int cutoff = candidates.size() / 2;
+            for(int i = 0; i < cutoff; i++) {
+                int last_index = --formula.num_clauses;
+
+                // Clause to be deleted is the last clause
+                if(candidates[i] == last_index) {
+                    formula.clauses.pop_back();
+                    continue;
+                }
+
+                // Clause to be deleted is in the middle (swap-and-pop with more steps)
+                formula.clauses[i] = formula.clauses[last_index];
+                formula.clauses[i].pop_back();
+
+                // Updating any assignment reasons if the clause was rearranged
+                for(int j = 0; j < assignment_reason.size(); j++) {
+                    if(assignment_reason[j] == last_index) {
+                        assignment_reason[j] = i;
+                    }
+                }
+
+                // Updating any candidates for culling if the clause was rearranged
+                // TODO: Optimize to not double-tread over candidates
+                for(int j = 0; j < cutoff; j++) {
+                    if(candidates[j] == last_index) {
+                        candidates[j] = i;
+                    }
+                }
+            }
+
+            d.num_culls += cutoff;
+
+            return 0;
+        }
+
+        default:
+            std::cout << "ERROR: Unknown culling mode chosen" << std::endl;
+            break;
+    }
+
+    // Fallout return (for default case)
+    return 1;
+}
+
 /* Runs the CDCL algorithm (but with a loop instead)
  * Inputs:
  *      formula: Takes the initial CNF that has literals from 1 to num_variables.
@@ -536,7 +698,8 @@ int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const
  * Output:
  *      Returns the verdict.
  */
-bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, VSIDS &V, data &d) {
+bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, const int C_MODE, 
+    VSIDS &V, clauseActivity &CA, data &d) {
     // Stores the backtracking trail for the assignments
     std::vector<int> trail;
     std::vector<int> assignment_level(formula.num_variables + 1);
@@ -549,8 +712,12 @@ bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, VSIDS &
 
     int guess_level = 0;  // Stores the guess level of the current propagation
 
+    // V2.3: Added a counter so that some of the resolution clauses are culled every couple of iterations.
+    int count = 0;
+    int threshold = CA.THRESHOLD_INIT;
+
     while (true) {
-        int status = unitPropagation(formula, assignments, trail, assignment_level, assignment_reason, guess_level, V, d);
+        int status = unitPropagation(formula, assignments, trail, assignment_level, assignment_reason, guess_level, V, CA, d);
 
         // Critical error encountered
         if(status == -1) return false;
@@ -575,6 +742,14 @@ bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, VSIDS &
         trail.push_back(index);
         assignment_level[index] = guess_level;
         assignment_reason[index] = -1;
+
+        // V2.3: Invokes clause culling and geometrically increments the threshold
+        count++;
+        if(count >= threshold) {
+            int log = clauseCulling(formula, trail, assignment_reason, C_MODE, CA, d);
+            if(log == 1) return false; // Break out if an error is picked up
+            threshold *= CA.THRESHOLD_RATIO;
+        }
     }
     // If the loop somehow exits, return false (this should never happen)
     return false;
@@ -719,17 +894,18 @@ bool verifyAssignments(const CNF &formula, const std::vector<int> &assignments, 
 // Command for generating cdcl.exe: g++ -o cdcl_v2 CDCL_V2.cpp
 // Command for running program: ./cdcl "[X]", where X is the name of the file location of the dataset.
 int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
-    if (argc != 2 && argc != 3 && argc != 4) {
-        std::cout << "Usage: ./cdcl_v2 <benchmark_folder> [output_csv] [heuristic_mode]" << std::endl;
-        std::cout << "Example: ./cdcl_v2 benchmarks/uf50-218 cdcl_v2_cpp_uf50_1000.csv 0" << std::endl;
-        std::cout << "Example: ./cdcl_v2 benchmarks/uuf50-218 cdcl_v2_cpp_uuf50_1000.csv 0" << std::endl;
+    if (argc != 2 && argc != 3 && argc != 4 && argc != 5) {
+        std::cout << "Usage: ./cdcl_v2 <benchmark_folder> [output_csv] [heuristic_mode] [culling_mode]" << std::endl;
+        std::cout << "Example: ./cdcl_v2 benchmarks/uf50-218 cdcl_v2_cpp_uf50_1000.csv 0 0" << std::endl;
+        std::cout << "Example: ./cdcl_v2 benchmarks/uuf50-218 cdcl_v2_cpp_uuf50_1000.csv 0 0" << std::endl;
         return 1;
     }
 
     std::string benchmarkFolder = argv[1];
 
-    bool writeCSV = (argc == 3);
-    int heuristic_mode = (argc == 4 ? std::atoi(argv[3]) : 0);
+    bool writeCSV = (argc >= 3);
+    int heuristic_mode = (argc >= 4 ? std::atoi(argv[3]) : 0);
+    int culling_mode = (argc >= 5 ? std::atoi(argv[4]) : 0);
     std::ofstream csv;
 
     if (writeCSV) {
@@ -764,8 +940,9 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
     int totalAssignments = 0;
     int totalBacktrack = 0;
     int totalResolutions = 0;
+    int totalCulls = 0;
 
-    const int NUM_FILES = 10;
+    const int NUM_FILES = 100;
 
     for (const auto& filePath : files) {
         std::string filename = filePath.string();
@@ -774,13 +951,15 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
 
         std::vector<int> key;
         CNF reformat_formula = reformat(formula, key);
-        data d;
         VSIDS V = initVSIDS(reformat_formula);
+        clauseActivity CA;
+        CA.num_clauses = reformat_formula.num_clauses;
+        data d;
 
         auto start = std::chrono::high_resolution_clock::now();
 
         std::vector<int> assignments(reformat_formula.num_variables + 1);
-        bool verdict = CDCL(reformat_formula, assignments, heuristic_mode, V, d);
+        bool verdict = CDCL(reformat_formula, assignments, heuristic_mode, culling_mode, V, CA, d);
 
         auto end = std::chrono::high_resolution_clock::now();
 
@@ -810,6 +989,7 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
         totalAssignments += d.num_assignments;
         totalBacktrack += d.num_backtrack;
         totalResolutions += d.num_resolutions;
+        totalCulls += d.num_culls;
 
         if (writeCSV) {
             csv << filename << ","
@@ -843,6 +1023,7 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
     std::cout << "avg assignments: " << 1.0 * totalAssignments / numSolved << std::endl;
     std::cout << "avg backtracks: " << 1.0 * totalBacktrack / numSolved << std::endl;
     std::cout << "avg resolutions: " << 1.0 * totalResolutions / numSolved << std::endl;
+    std::cout << "avg culls: " << 1.0 * totalCulls / numSolved << std::endl;
 
     std::cout << std::endl;
     std::cout << "SAT count: " << satCount << std::endl;
