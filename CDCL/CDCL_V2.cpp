@@ -107,7 +107,7 @@ VSIDS initVSIDS(CNF formula) {
 
 struct clauseActivity {
     double increment = 0.5;
-    int num_clauses; // Stores the number of clauses that the CNF originally started with
+    int base_num_clauses; // Stores the number of clauses that the CNF originally started with
 
     const double RATIO = 1.001;
     const double RESCALE_RATIO = std::pow(10, 20);
@@ -197,9 +197,9 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
         const std::vector<int> &reasonClause = formula.clauses[reasonIndex];
 
         // V2.3: If the reason clause is a learned clause, then the appropriate activity is increased
-        if(reasonIndex >= CA.num_clauses) {
+        if(reasonIndex >= CA.base_num_clauses) {
             // Can assume that there is a value initialized because the activity is created whenever a new clause is added.
-            CA.activity[reasonIndex - CA.num_clauses] += CA.increment;
+            CA.activity[reasonIndex - CA.base_num_clauses] += CA.increment;
         }
 
         // Deletes any instances of the latest assigned literal
@@ -585,14 +585,12 @@ int clauseCulling(CNF &formula, const std::vector<int> &trail, std::vector<int> 
         case 0: { return 0; }
         case 1: {
             std::vector<int> candidates;
-            int base_num_clauses = CA.num_clauses; // Starting point for resolution clauses
+            int base_num_clauses = CA.base_num_clauses; // Starting point for resolution clauses
 
             // Select all non-binary and non-unit clauses
             for(int i = base_num_clauses; i < formula.num_clauses; i++) {
                 if(formula.clauses[i].size() > 2) candidates.push_back(i);
             }
-
-            std::cout << "Flag 1" << std::endl;
 
             // Remove all clauses part of the trail
             std::vector<int> used;
@@ -604,26 +602,20 @@ int clauseCulling(CNF &formula, const std::vector<int> &trail, std::vector<int> 
                 }
             }
 
-            std::cout << "Flag 2" << std::endl;
-
             for(int i = 0; i < candidates.size(); i++) {
                 int index = std::find(used.begin(), used.end(), candidates[i]) - used.begin();
                 if(index != used.end() - used.begin()) {
-                    candidates[index] = candidates.back();
+                    candidates[i] = candidates.back();
                     candidates.pop_back();
                     i--;
                 }
             }
 
-            std::cout << "Flag 3" << std::endl;
-
             // Extract activity values corresponding to the candidates vector
-            std::vector<int> activity;
+            std::vector<double> activity;
             for(int x : candidates) {
                 activity.push_back(CA.activity[x - base_num_clauses]);
             }
-
-            std::cout << "Flag 4" << std::endl;
 
             // Sort activities and corresponding clause indices to be ascending. Bottom half will be culled.
             // TODO: Use a better sorting algorithm? Currently uses bubble sort
@@ -643,8 +635,6 @@ int clauseCulling(CNF &formula, const std::vector<int> &trail, std::vector<int> 
                 }
             }
 
-            std::cout << "Flag 5" << std::endl;
-
             // Cull bottom half of resolution clauses
             int cutoff = candidates.size() / 2;
             for(int i = 0; i < cutoff; i++) {
@@ -653,17 +643,21 @@ int clauseCulling(CNF &formula, const std::vector<int> &trail, std::vector<int> 
                 // Clause to be deleted is the last clause
                 if(candidates[i] == last_index) {
                     formula.clauses.pop_back();
+                    CA.activity.pop_back();
                     continue;
                 }
 
                 // Clause to be deleted is in the middle (swap-and-pop with more steps)
-                formula.clauses[i] = formula.clauses[last_index];
-                formula.clauses[i].pop_back();
+                formula.clauses[candidates[i]] = formula.clauses[last_index];
+                formula.clauses.pop_back();
+
+                CA.activity[candidates[i] - base_num_clauses] = CA.activity[last_index - base_num_clauses];
+                CA.activity.pop_back();
 
                 // Updating any assignment reasons if the clause was rearranged
                 for(int j = 0; j < assignment_reason.size(); j++) {
                     if(assignment_reason[j] == last_index) {
-                        assignment_reason[j] = i;
+                        assignment_reason[j] = candidates[i];
                     }
                 }
 
@@ -671,7 +665,7 @@ int clauseCulling(CNF &formula, const std::vector<int> &trail, std::vector<int> 
                 // TODO: Optimize to not double-tread over candidates
                 for(int j = 0; j < cutoff; j++) {
                     if(candidates[j] == last_index) {
-                        candidates[j] = i;
+                        candidates[j] = candidates[i];
                     }
                 }
             }
@@ -746,9 +740,18 @@ bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, const i
         // V2.3: Invokes clause culling and geometrically increments the threshold
         count++;
         if(count >= threshold) {
+            count = 0;
             int log = clauseCulling(formula, trail, assignment_reason, C_MODE, CA, d);
             if(log == 1) return false; // Break out if an error is picked up
             threshold *= CA.THRESHOLD_RATIO;
+        }
+
+        // DEBUG
+        if (d.num_resolutions % 200 == 0) {
+            std::cout << "conflicts=" << d.num_resolutions
+                        << " clauses=" << formula.num_clauses
+                        << " level=" << guess_level
+                        << std::endl;
         }
     }
     // If the loop somehow exits, return false (this should never happen)
@@ -953,7 +956,7 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
         CNF reformat_formula = reformat(formula, key);
         VSIDS V = initVSIDS(reformat_formula);
         clauseActivity CA;
-        CA.num_clauses = reformat_formula.num_clauses;
+        CA.base_num_clauses = reformat_formula.num_clauses;
         data d;
 
         auto start = std::chrono::high_resolution_clock::now();
