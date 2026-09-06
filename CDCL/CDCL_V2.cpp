@@ -16,6 +16,8 @@
  *      Implemented VSIDS as a heuristic
  * Version 2.3 changes:
  *      Created a tracker for clause deletion using activity scores (similar to VSIDS)
+ *      Implemented a two-watched-literals scheme for unit propagation
+ *      Hijacked assignments[0] to keep track of total # of currently assigned literals
  */
 
 /* General comments:
@@ -23,7 +25,9 @@
  * Example 1: The literal "1" would have its value stored at assignment[1] and its trail level at assignment_level[1].
  * Example 2: The literal "-3" would have its value stored at assignment[3] and its trail level at assignment_level[3].
  * 
- * For the assignments, "0" indicates that the literal is unassigned while 1/-1 represents true/false respectively. 2/-2 are also unassigned, but store the last assignment used.
+ * For the assignments, "0" indicates that the literal is unassigned while 1/-1 represents true/false respectively. 
+ * 2/-2 are also unassigned, but store the last assignment used. The 0th index stores the number of currently assigned literals.
+ * 
  * For the assignment levels, the value indicates the level. Has a default value of -1.
  * For the assignment reasons, the value indicates the clause index that resulted in the assignment. Has a default value of -2 and uses -1 for any decision.
  * A value of -1 instead indicates that the assignment was from a decision.
@@ -34,8 +38,13 @@
  * 
  * Notes about "tricks":
  * 
- * VSIDS: Considered to have worse decision quality in exchange for much less overhead. However, hard to parallelize
- * 
+ * VSIDS: Considered to have worse decision quality than highest-frequency in exchange for much less overhead. However, hard to parallelize since the activity 
+ *      has to be accessed and modified from multiple places.
+ * Clause Culling: Helps keep the amount of memory consumed by resolution clauses under control. Slightly reduces efficiency, but its a pretty good way to make
+ *      sure an excessive memory is not consumed. However, deletion being parallelly synchronized may be a bit of an issue (one dead cycle?)
+ * Two-Watched-Literals: Saves an incredibly significant amount of overhead since the propagation function no longer scans all the clauses, which can become
+ *      extremely massive for larger CNFs. Absolutely worth it if running on any large problem. Synchronizing the correct clause index may be a bit of an issue
+ *      with clause culling though.
  */
 
 // File parsing
@@ -67,18 +76,27 @@ struct data {
     int num_culls = 0;        // Total number of resolution clauses culled
 };
 
+/* VSIDS: Contains all relevant VSIDS parameters. Gets updated whenever a value is unassigned due to backtracking.
+ * active: Determines whether anything that interacts with VSIDS is active. Useful for runtime tests.
+ * increment: Initial increment for the weight values for each literal.
+ * RATIO: Geometric ratio of the increment every main loop cycle.
+ * RESCALE_RATIO: Rescales the threshold by this value when the increment exceeds it.\
+ * weight: Contains the weight values indexed by literal.
+ * seen: Helper vector for keeping track of which literals to update in weights.
+ */
 struct VSIDS { // TODO: Use a variable heap?
+    bool active = false;
     double increment = 0.5;
 
     const double RATIO = 1.2;
     const double RESCALE_RATIO = std::pow(10, 100);
 
-    std::vector<double> weight; // Vector that holds the weights of literals
-    std::vector<bool> seen;     // Helper vector for keeping track of which literals to update in weights
+    std::vector<double> weight;
+    std::vector<bool> seen;
 };
 
-VSIDS initVSIDS(CNF formula) {
-    VSIDS V;
+// Initialize VSIDS parameters using the frequency of literals in the original CNF
+void initVSIDS(VSIDS &V, CNF formula) {
     std::vector<double> &w = V.weight;
     std::vector<bool> &s = V.seen;
 
@@ -101,11 +119,18 @@ VSIDS initVSIDS(CNF formula) {
         w.push_back(n);
         s.push_back(false);
     }
-
-    return V;
 }
 
+/* clauseActivity: Contains all relevant parameters for clause activity and culling. Used in culling at a geometrically decreasing frequency in the main loop.
+ * active: Determines whether anything that interacts with clause activity is active. Useful for runtime tests.
+ * increment: Initial increment for the activity values for each clause.
+ * base_num_clauses: The original number of clauses in the CNF, used to index the activity vector properly.
+ * RATIO: Geometric ratio of the increment every main loop cycle.
+ * RESCALE_RATIO: Rescales the threshold by this value when the increment exceeds it.
+ * activity: Contains the activity values for each resolution clause. The first index is the first resolution clause and all values start at 0.
+ */
 struct clauseActivity {
+    bool active = false;
     double increment = 0.5;
     int base_num_clauses; // Stores the number of clauses that the CNF originally started with
 
@@ -116,6 +141,42 @@ struct clauseActivity {
 
     std::vector<double> activity; // Vector that holds the activity of clauses
 };
+
+/* TWL: Contains all relevant parameters for two-watched-literals. Used to heavily reduce overhead during unit propagation for larger CNFs.
+ * active: Determines whether anything that uses TWL is active. Useful for runtime tests.
+ * trailIndex: Holds the trail index that has been verified up to.
+ * watched: Clauses that are watched by certain literals.
+ * 
+ * Notes about watched: 
+ *  Indexed by literal, nonnegative clause indices are unchanged while negative clause indices are offset by 1. 
+ *  Polarity used to reflect the literal polarity. All watched literals are in indices 0 or 1 for each clause.
+ */
+struct TWL {
+    bool active = false;
+    int trailIndex = 0;
+    std::vector<std::vector<int>> watched;
+};
+
+// Initializes TWL
+void initTWL(TWL &T, CNF formula) {
+    T.watched = std::vector<std::vector<int>>(formula.num_variables + 1);
+
+    // Stores the first two literals in each clause in the watch list
+    for(int i = 0; i < formula.num_clauses; i++) {\
+        std::vector<int> &clause = formula.clauses[i];
+        // Skips past empty clauses
+        if(clause.size() == 0) continue;
+
+        int value1 = clause[0];
+        T.watched[std::abs(value1)].push_back((value1 > 0) ? i : -(i + 1));
+
+        // Adds only one value to watch list for unit clause
+        if(clause.size() == 1) continue;
+
+        int value2 = clause[1];
+        T.watched[std::abs(value2)].push_back((value2 > 0) ? i : -(i + 1));
+    }
+}
 
 // Function for debugging
 void printCNF(const CNF &formula) {
@@ -130,6 +191,18 @@ void printCNF(const CNF &formula) {
         }
         std::cout << "." << std::endl;
     }
+}
+
+// Simple helper function to assign a certain literal to its polarity
+void assignLiteral(std::vector<int> &assignments, std::vector<int> &trail, std::vector<int> &assignment_level, std::vector<int> &assignment_reason,
+    int &guess_level, int lit, int reason) {
+    
+    int index = std::abs(lit);
+    assignments[0]++; // V2.3: Increments total assignment counter
+    assignments[index] = lit > 0 ? 1 : -1;
+    trail.push_back(index);
+    assignment_level[index] = guess_level;
+    assignment_reason[index] = reason;
 }
 
 /* Resolves a conflict that occurs at a given index. Performs backtracking, updates the guess level, and returns a flag.
@@ -150,19 +223,19 @@ void printCNF(const CNF &formula) {
  */
 int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int> &trail, 
     std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, 
-    int conflictIndex, VSIDS &V, clauseActivity &CA, data &d) {
+    int conflictIndex, VSIDS &V, clauseActivity &CA, TWL &T, data &d) {
 
     // Resolution clause
     std::vector<int> resolution = formula.clauses[conflictIndex];
     int count = 0;
-
+    
     std::vector<int> updateVSIDS; // V2.2
     for(int i = 0; i < resolution.size(); i++) {
         int index = std::abs(resolution[i]);
-        if(assignment_level[index] == guess_level) count++;\
+        if(assignment_level[index] == guess_level) count++;
 
-        // V2.2
-        if(V.seen[index] == false) {
+        // V2.2: Updating VSIDS seen vector
+        if(V.active && V.seen[index] == false) {
             V.seen[index] = true;
             updateVSIDS.push_back(index);
         }
@@ -197,7 +270,7 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
         const std::vector<int> &reasonClause = formula.clauses[reasonIndex];
 
         // V2.3: If the reason clause is a learned clause, then the appropriate activity is increased
-        if(reasonIndex >= CA.base_num_clauses) {
+        if(CA.active && reasonIndex >= CA.base_num_clauses) {
             // Can assume that there is a value initialized because the activity is created whenever a new clause is added.
             CA.activity[reasonIndex - CA.base_num_clauses] += CA.increment;
         }
@@ -216,11 +289,13 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
         for(int x : reasonClause) {
             if((x != latest_lit && x != -latest_lit) && (std::find(resolution.begin(), resolution.end(), x) == resolution.end())) resolution.push_back(x);
 
-            // V2.2
-            int i = std::abs(x);
-            if(V.seen[i] == false) {
-                V.seen[i] = true;
-                updateVSIDS.push_back(i);
+            // V2.2: Updating VSIDS seen vector, ensuring that no duplicates occur.
+            if(V.active) {
+                int i = std::abs(x);
+                if(V.seen[i] == false) {
+                    V.seen[i] = true;
+                    updateVSIDS.push_back(i);
+                }
             }
         }
 
@@ -259,7 +334,16 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
         d.num_resolutions++;
 
         // V2.3: Initializes activity value for new clause
-        CA.activity.push_back(CA.increment);
+        if(CA.active) CA.activity.push_back(CA.increment);
+
+        // V2.3: Adds first two literals as watched literals (only adds one watched literal if unit clause)
+        if(T.active) {
+            for(int i = 0; i < resolution.size(); i++) {
+                T.watched[std::abs(resolution[i])].push_back(resolution[i] > 0 ? formula.num_clauses - 1 : -formula.num_clauses);
+
+                if(i == 1) break;
+            }
+        }
 
         // Backtracking
         while(!trail.empty()) {
@@ -269,11 +353,15 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
             
             if(tl <= target_level) break;
 
+            assignments[0]--; // V2.3: Decrements total assignment counter
             assignments[var] = assignments[var] > 0 ? 2 : -2; // V2.2: Now resets to 2/-2 depending on previous assignment
             trail.pop_back();
             assignment_level[var] = -1;
             assignment_reason[var] = -2;
             d.num_backtrack++;
+
+            // V2.3: Backtrack trail index for TWL if necessary
+            if(T.active && trail.size() < T.trailIndex) T.trailIndex = trail.size();
         }
 
         // If backtracked too far: Error
@@ -282,37 +370,37 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
             return -1;
         }
 
-        // Assert learned clause value
-        int index = std::abs(resolveLit);
-        assignments[index] = resolveLit > 0 ? 1 : -1;
-        trail.push_back(index);
-        assignment_level[index] = target_level;
-        assignment_reason[index] = formula.num_clauses - 1; // New resolution clause should be the one at the very back
-
         guess_level = target_level;
 
-        // V2.2: Updates VSIDS parameters after resolution
-        if(V.increment > V.RESCALE_RATIO) { // Safety for overflow
-            V.increment /= V.RESCALE_RATIO;
-            for(int i = 0; i < V.weight.size(); i++) { 
-                V.weight[i] /= V.RESCALE_RATIO;
-            }
-        }
+        // Assert learned clause value
+        assignLiteral(assignments, trail, assignment_level, assignment_reason, guess_level, resolveLit, formula.num_clauses - 1);
 
-        for(int x : updateVSIDS) {
-            V.weight[x] += V.increment;
-            V.seen[x] = false;
+        // V2.2: Updates VSIDS parameters after resolution
+        if(V.active) {
+            if(V.increment > V.RESCALE_RATIO) { // Safety for overflow
+                V.increment /= V.RESCALE_RATIO;
+                for(int i = 0; i < V.weight.size(); i++) { 
+                    V.weight[i] /= V.RESCALE_RATIO;
+                }
+            }
+
+            for(int x : updateVSIDS) {
+                V.weight[x] += V.increment;
+                V.seen[x] = false;
+            }
+            V.increment *= V.RATIO;
         }
-        V.increment *= V.RATIO;
 
         // V2.3: Update clause activity parameters after resolution
-        if(CA.increment >= CA.RESCALE_RATIO) { // Safety for overflow 
-            CA.increment /= CA.RESCALE_RATIO;
-            for(int i = 0; i < CA.activity.size(); i++) {
-                CA.activity[i] /= CA.RESCALE_RATIO;
+        if(CA.active) {
+            if(CA.increment >= CA.RESCALE_RATIO) { // Safety for overflow 
+                CA.increment /= CA.RESCALE_RATIO;
+                for(int i = 0; i < CA.activity.size(); i++) {
+                    CA.activity[i] /= CA.RESCALE_RATIO;
+                }
             }
+            CA.increment *= CA.RATIO;
         }
-        CA.increment *= CA.RATIO;
 
         // Conflict resolution complete
         return 0;
@@ -342,75 +430,171 @@ int resolveConflict(CNF &formula, std::vector<int> &assignments, std::vector<int
  */
 int unitPropagation(CNF &formula, std::vector<int> &assignments, std::vector<int> &trail,
     std::vector<int> &assignment_level, std::vector<int> &assignment_reason, int &guess_level, 
-    VSIDS &V, clauseActivity &CA, data &d) {
+    VSIDS &V, clauseActivity &CA, TWL &T, data &d) {
 
-    // Unit Propagation
-    while(true) {
-        bool allSat = true;
-        bool flag = true;
-        for(int i = 0; i < formula.num_clauses; i++) {
-            // Various flags to check the status of the clause.
-            bool sat = false;
-            int count = 0;
-            int lit = 0;
-            std::vector<int> &clause = formula.clauses[i];
+    // V2.3 Unit propagation (TWL)
+    if(T.active) {
+        // Trail index is at 0, which only occurs at startup
+        if(T.trailIndex == 0) {
+            // Scans for purely unit clauses
+            for(int i = 0; i < formula.num_clauses; i++) {
+                const std::vector<int> &clause = formula.clauses[i];
+                if(clause.size() == 1) {
+                    if(assignments[std::abs(clause[0])] == (clause[0] > 0 ? -1 : 1)) return 1; // Unsat if two unit clauses clash with each other
 
-            for(int x : clause) {
-                int value = assignments[std::abs(x)];
-
-                // If the clause is already satisfied 
-                // TODO: Could have a separate tracker for which clauses are already satisfied?
-                // Apparently two-watched literals implements this idea but better.
-                if(value == (x > 0 ? 1 : -1)) {
-                    sat = true;
-                    break;
-                }
-
-                // Stores the unassigned literal and increments count (no purpose in keeping track of more literals past 1)
-                if(count < 2 && (value != -1 && value != 1)) { // V2.2: Right condition originally checked value == 0
-                    count++;
-                    lit = x;
+                    if(assignments[std::abs(clause[0])] == (clause[0] > 0 ? 1 : -1)) continue; // Skips reassignment if already assigned
+                    assignLiteral(assignments, trail, assignment_level, assignment_reason, guess_level, clause[0], i);
+                    d.num_assignments++;
                 }
             }
+        }
 
-            if(sat) continue;
+        while(T.trailIndex < trail.size()) {
+            int index = trail[T.trailIndex];
+            T.trailIndex++;
+            std::vector<int> &watch = T.watched[index];
 
-            // Unsatisfiable clause found, need to perform conflict resolution
-            if(count == 0) {
-                int status = resolveConflict(formula, assignments, trail, assignment_level, assignment_reason, guess_level, i, V, CA, d);
+            // The literal has been recently assigned and needs to be checked
+            int assignment = assignments[index];
+            if(assignment == -1 || assignment == 1) {
+                for(int i = 0; i < watch.size(); i++) {
+                    int rawIndex = watch[i];
+                    // Polarity matches: Ignore this clause
+                    if((rawIndex >= 0 && assignment > 0) || (rawIndex < 0 && assignment < 0)) continue;
 
-                // If conflict is successfully resolved, tries propagation again.
-                if(status == 0) {
+                    // Current watch literal is falsified
+                    int clauseIndex = (rawIndex >= 0) ? rawIndex : -rawIndex - 1;
+                    std::vector<int> &clause = formula.clauses[clauseIndex];
+
+                    bool flag = true;
+                    int currentWatchIndex = 0;
+                    for(int j = 0; j < clause.size(); j++) {
+                        int value = clause[j];
+                        int valueIndex = std::abs(value);
+                        if(j < 2) { // Watched literals
+                            // Other watched literal is already satisfied: Ignore this clause
+                            if(valueIndex != index && assignments[valueIndex] == (value > 0 ? 1 : -1)) {
+                                flag = false;
+                                break;
+                            }
+
+                            // Currently on watched literal
+                            if(valueIndex == index) currentWatchIndex = j;
+                        } else { // Other literals, scanning for a potential other literal to use
+                            if(assignments[valueIndex] != (value > 0 ? -1 : 1)) { // An unassigned/satisifed literal is found, swap places
+                                // Removing the old watched literal
+                                watch[i] = watch.back();
+                                watch.pop_back();
+                                i--;
+
+                                // Adding the new watched literal
+                                T.watched[valueIndex].push_back(value > 0 ? clauseIndex : -(clauseIndex + 1));
+
+                                // Swapping around the literals in the clause
+                                clause[j] = clause[currentWatchIndex];
+                                clause[currentWatchIndex] = value;
+
+                                flag = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    // No watched literal is currently satisfied and no replacement watched literal is available
+                    if(flag) {
+                        if(clause.size() != 1) {
+                            int otherWatch = clause[!currentWatchIndex]; // currentWatchIndex can only be 0 or 1
+                            int value = assignments[std::abs(otherWatch)];
+                            if(value != -1 && value != 1) { // Since there is no replacement, the other watched variable must be assigned if possible
+                                assignLiteral(assignments, trail, assignment_level, assignment_reason, guess_level, otherWatch, clauseIndex);
+                                d.num_assignments++;
+                                continue;
+                            }
+                        }
+
+                        // If code reaches this point, a conflict occurred.
+                        int status = resolveConflict(formula, assignments, trail, assignment_level, assignment_reason, guess_level, clauseIndex, V, CA, T, d);
+
+                        // If conflict is successfully resolved, tries propagation again.
+                        if(status == 0) break;
+
+                        // Falls through if a critical error occurs or an unresolvable conflict is detected.
+                        return status;
+                    }
+                }
+            } else {
+                std::cout << "ERROR: Trail contains an assignment that doesn't exist" << std::endl;
+                return -1;
+            }
+        }
+
+        // All varaibles assigned without conflict = fully satisfied
+        if(assignments[0] == formula.num_variables) return 2;
+        return 0;
+    } else { // Unit propagation (naive)
+        while(true) {
+            bool allSat = true;
+            bool flag = true;
+            for(int i = 0; i < formula.num_clauses; i++) {
+                // Various flags to check the status of the clause.
+                bool sat = false;
+                int count = 0;
+                int lit = 0;
+                std::vector<int> &clause = formula.clauses[i];
+
+                for(int x : clause) {
+                    int value = assignments[std::abs(x)];
+
+                    // If the clause is already satisfied 
+                    // TODO: Could have a separate tracker for which clauses are already satisfied?
+                    // Apparently two-watched literals implements this idea but better.
+                    if(value == (x > 0 ? 1 : -1)) {
+                        sat = true;
+                        break;
+                    }
+
+                    // Stores the unassigned literal and increments count (no purpose in keeping track of more literals past 1)
+                    if(count < 2 && (value != -1 && value != 1)) { // V2.2: Right condition originally checked value == 0
+                        count++;
+                        lit = x;
+                    }
+                }
+
+                if(sat) continue;
+
+                // Unsatisfiable clause found, need to perform conflict resolution
+                if(count == 0) {
+                    int status = resolveConflict(formula, assignments, trail, assignment_level, assignment_reason, guess_level, i, V, CA, T, d);
+
+                    // If conflict is successfully resolved, tries propagation again.
+                    if(status == 0) {
+                        flag = false;
+                        break;
+                    }
+
+                    // Falls through if a critical error occurs or an unresolvable conflict is detected.
+                    return status;
+                }
+
+                // Unit clause found
+                if(count == 1) {
+                    assignLiteral(assignments, trail, assignment_level, assignment_reason, guess_level, lit, i);
+                    d.num_assignments++;
+
                     flag = false;
                     break;
                 }
 
-                // Falls through if a critical error occurs or an unresolvable conflict is detected.
-                return status;
+                // A clause is not satisfied. (This flag does not need to be kept track of if any of the above if statements are triggered since a new propagation starts)
+                allSat = false;
             }
 
-            // Unit clause found
-            if(count == 1) {
-                int index = std::abs(lit);
-                assignments[index] = (lit > 0 ? 1 : -1);
-                trail.push_back(index);
-                assignment_level[index] = guess_level;
-                assignment_reason[index] = i;
-                d.num_assignments++;
+            // Breaks loop if no more unit clauses are found
+            if(flag) {
+                if(allSat) return 2;
 
-                flag = false;
-                break;
+                return 0;
             }
-
-            // A clause is not satisfied. (This flag does not need to be kept track of if any of the above if statements are triggered since a new propagation starts)
-            allSat = false;
-        }
-
-        // Breaks loop if no more unit clauses are found
-        if(flag) {
-            if(allSat) return 2;
-
-            return 0;
         }
     }
 
@@ -577,10 +761,10 @@ int chooseLiteral(const CNF &formula, const std::vector<int> &assignments, const
  * 
  * Current Modes:
  *      0: Default, does nothing.
- *      1: Clause culling uses 
+ *      1: Clause culling culls the bottom half of clause activity
  */
 int clauseCulling(CNF &formula, const std::vector<int> &trail, std::vector<int> &assignment_reason,
-    const int C_MODE, clauseActivity &CA, data &d) {
+    const int C_MODE, clauseActivity &CA, TWL &T, data &d) {
     switch(C_MODE) {
         case 0: { return 0; }
         case 1: {
@@ -644,20 +828,39 @@ int clauseCulling(CNF &formula, const std::vector<int> &trail, std::vector<int> 
                 if(candidates[i] == last_index) {
                     formula.clauses.pop_back();
                     CA.activity.pop_back();
-                    continue;
+                } else { // Clause to be deleted is in the middle (swap-and-pop with more steps)
+                    formula.clauses[candidates[i]] = formula.clauses[last_index];
+                    formula.clauses.pop_back();
+
+                    CA.activity[candidates[i] - base_num_clauses] = CA.activity[last_index - base_num_clauses];
+                    CA.activity.pop_back();
                 }
-
-                // Clause to be deleted is in the middle (swap-and-pop with more steps)
-                formula.clauses[candidates[i]] = formula.clauses[last_index];
-                formula.clauses.pop_back();
-
-                CA.activity[candidates[i] - base_num_clauses] = CA.activity[last_index - base_num_clauses];
-                CA.activity.pop_back();
 
                 // Updating any assignment reasons if the clause was rearranged
                 for(int j = 0; j < assignment_reason.size(); j++) {
                     if(assignment_reason[j] == last_index) {
                         assignment_reason[j] = candidates[i];
+                    }
+                }
+
+                // Updating any watched clauses for TWL
+                if(T.active) {
+                    for(int j = 0; j < T.watched.size(); j++) {
+                        std::vector<int> &clauseList = T.watched[j];
+
+                        for(int k = 0; k < clauseList.size(); k++) {
+                            int raw_index = clauseList[k];
+                            int converted_index = raw_index >= 0 ? raw_index : -raw_index - 1;
+
+                            // Clause matches the one that needs to be culled: should be removed
+                            if(converted_index == candidates[i]) {
+                                clauseList[k] = clauseList.back();
+                                clauseList.pop_back();
+                                k--;
+                            } else if(converted_index == last_index) { // Clause is the clause that was just moved: should be updated
+                                clauseList[k] = raw_index >= 0 ? candidates[i] : -(candidates[i] + 1);
+                            }
+                        }
                     }
                 }
 
@@ -693,7 +896,7 @@ int clauseCulling(CNF &formula, const std::vector<int> &trail, std::vector<int> 
  *      Returns the verdict.
  */
 bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, const int C_MODE, 
-    VSIDS &V, clauseActivity &CA, data &d) {
+    VSIDS &V, clauseActivity &CA, TWL &T, data &d) {
     // Stores the backtracking trail for the assignments
     std::vector<int> trail;
     std::vector<int> assignment_level(formula.num_variables + 1);
@@ -711,7 +914,7 @@ bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, const i
     int threshold = CA.THRESHOLD_INIT;
 
     while (true) {
-        int status = unitPropagation(formula, assignments, trail, assignment_level, assignment_reason, guess_level, V, CA, d);
+        int status = unitPropagation(formula, assignments, trail, assignment_level, assignment_reason, guess_level, V, CA, T, d);
 
         // Critical error encountered
         if(status == -1) return false;
@@ -731,28 +934,27 @@ bool CDCL(CNF &formula, std::vector<int> &assignments, const int H_MODE, const i
         guess_level++;
         d.num_decisions++;
 
-        int index = std::abs(lit);
-        assignments[index] = lit > 0 ? 1 : -1;
-        trail.push_back(index);
-        assignment_level[index] = guess_level;
-        assignment_reason[index] = -1;
+        assignLiteral(assignments, trail, assignment_level, assignment_reason, guess_level, lit, -1);
 
         // V2.3: Invokes clause culling and geometrically increments the threshold
-        count++;
-        if(count >= threshold) {
-            count = 0;
-            int log = clauseCulling(formula, trail, assignment_reason, C_MODE, CA, d);
-            if(log == 1) return false; // Break out if an error is picked up
-            threshold *= CA.THRESHOLD_RATIO;
+        if(CA.active) {
+            count++;
+            if(count >= threshold) {
+                count = 0;
+                int log = clauseCulling(formula, trail, assignment_reason, C_MODE, CA, T, d);
+                if(log == 1) return false; // Break out if an error is picked up
+                threshold *= CA.THRESHOLD_RATIO;
+            }
         }
 
         // DEBUG
-        if (d.num_resolutions % 200 == 0) {
-            std::cout << "conflicts=" << d.num_resolutions
-                        << " clauses=" << formula.num_clauses
-                        << " level=" << guess_level
-                        << std::endl;
-        }
+        // if (d.num_resolutions % 200 == 0) {
+        //     std::cout << "conflicts=" << d.num_resolutions
+        //                 << " clauses=" << formula.num_clauses
+        //                 << " culls=" << d.num_culls
+        //                 << " level=" << guess_level
+        //                 << std::endl;
+        // }
     }
     // If the loop somehow exits, return false (this should never happen)
     return false;
@@ -897,7 +1099,7 @@ bool verifyAssignments(const CNF &formula, const std::vector<int> &assignments, 
 // Command for generating cdcl.exe: g++ -o cdcl_v2 CDCL_V2.cpp
 // Command for running program: ./cdcl "[X]", where X is the name of the file location of the dataset.
 int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
-    if (argc != 2 && argc != 3 && argc != 4 && argc != 5) {
+    if (argc < 2 || argc > 6) {
         std::cout << "Usage: ./cdcl_v2 <benchmark_folder> [output_csv] [heuristic_mode] [culling_mode]" << std::endl;
         std::cout << "Example: ./cdcl_v2 benchmarks/uf50-218 cdcl_v2_cpp_uf50_1000.csv 0 0" << std::endl;
         std::cout << "Example: ./cdcl_v2 benchmarks/uuf50-218 cdcl_v2_cpp_uuf50_1000.csv 0 0" << std::endl;
@@ -909,6 +1111,7 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
     bool writeCSV = (argc >= 3);
     int heuristic_mode = (argc >= 4 ? std::atoi(argv[3]) : 0);
     int culling_mode = (argc >= 5 ? std::atoi(argv[4]) : 0);
+    int TWL_mode = (argc >= 6 ? std::atoi(argv[5]) : 0);
     std::ofstream csv;
 
     if (writeCSV) {
@@ -952,17 +1155,36 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
 
         CNF formula = parseFile(filename);
 
-        std::vector<int> key;
-        CNF reformat_formula = reformat(formula, key);
-        VSIDS V = initVSIDS(reformat_formula);
-        clauseActivity CA;
-        CA.base_num_clauses = reformat_formula.num_clauses;
-        data d;
-
         auto start = std::chrono::high_resolution_clock::now();
 
+        std::vector<int> key;
+        CNF reformat_formula = reformat(formula, key);
+
+        // Initializes and toggles VSIDS
+        VSIDS V;
+        if(heuristic_mode == 4) {
+            initVSIDS(V, reformat_formula);
+            V.active = true;
+        }
+
+        // Initializes and toggles clause activity
+        clauseActivity CA;
+        if(culling_mode == 1) {
+            CA.base_num_clauses = reformat_formula.num_clauses;
+            CA.active = true;
+        }
+
+        // Initializes and toggles TWL
+        TWL T;
+        if(TWL_mode == 1) {
+            initTWL(T, reformat_formula);
+            T.active = true;
+        }
+
+        data d;
+
         std::vector<int> assignments(reformat_formula.num_variables + 1);
-        bool verdict = CDCL(reformat_formula, assignments, heuristic_mode, culling_mode, V, CA, d);
+        bool verdict = CDCL(reformat_formula, assignments, heuristic_mode, culling_mode, V, CA, T, d);
 
         auto end = std::chrono::high_resolution_clock::now();
 
