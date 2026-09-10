@@ -97,27 +97,15 @@ struct VSIDS { // TODO: Use a variable heap?
 
 // Initialize VSIDS parameters using the frequency of literals in the original CNF
 void initVSIDS(VSIDS &V, CNF formula) {
-    std::vector<double> &w = V.weight;
-    std::vector<bool> &s = V.seen;
-
-    // Dummy values at index 0
-    w.push_back(0);
-    s.push_back(false);
+    V.weight = std::vector<double>(formula.num_variables + 1); // Should automatically initialize to zero
+    V.seen = std::vector<bool>(formula.num_variables + 1);     // Should automatically initialize to false
 
     // Initialize weights to the unsigned frequency of literals
     // TODO: Mess around with the initial values, maybe try Jeruslow-Wang score?
-    for(int i = 1; i <= formula.num_variables; i++) {
-        int n = 0;
-        for(const auto &clause : formula.clauses) {
-            for(int x : clause) {
-                if(x == i || x == -i) {
-                    n++;
-                    break;
-                }
-            }
+    for(const auto &clause : formula.clauses) {
+        for(int x : clause) {
+            V.weight[std::abs(x)] += 1;
         }
-        w.push_back(n);
-        s.push_back(false);
     }
 }
 
@@ -157,24 +145,95 @@ struct TWL {
     std::vector<std::vector<int>> watched;
 };
 
-// Initializes TWL
-void initTWL(TWL &T, CNF formula) {
+/* Initializes TWL
+ * Current Modes:
+ *      1: TWL with the two literals being the first two in the clause
+ *      2: TWL with the two literals prioritizing the most frequent literal using VSIDS initial values
+ */
+void initTWL(TWL &T, CNF formula, const VSIDS &V, const int T_MODE) {
     T.watched = std::vector<std::vector<int>>(formula.num_variables + 1);
 
     // Stores the first two literals in each clause in the watch list
-    for(int i = 0; i < formula.num_clauses; i++) {\
-        std::vector<int> &clause = formula.clauses[i];
-        // Skips past empty clauses
-        if(clause.size() == 0) continue;
+    if(T_MODE == 1) {
+        for(int i = 0; i < formula.num_clauses; i++) {\
+            std::vector<int> &clause = formula.clauses[i];
+            // Skips past empty clauses
+            if(clause.size() == 0) continue;
 
-        int value1 = clause[0];
-        T.watched[std::abs(value1)].push_back((value1 > 0) ? i : -(i + 1));
+            int value1 = clause[0];
+            T.watched[std::abs(value1)].push_back((value1 > 0) ? i : -(i + 1));
 
-        // Adds only one value to watch list for unit clause
-        if(clause.size() == 1) continue;
+            // Adds only one value to watch list for unit clause
+            if(clause.size() == 1) continue;
 
-        int value2 = clause[1];
-        T.watched[std::abs(value2)].push_back((value2 > 0) ? i : -(i + 1));
+            int value2 = clause[1];
+            T.watched[std::abs(value2)].push_back((value2 > 0) ? i : -(i + 1));
+        }
+    } else if (T_MODE == 2) {
+        if(V.active == false) {
+            std::cout << "ERROR: VSIDS is not active. Running standard TWL initialization." << std::endl;
+            initTWL(T, formula, V, 1);
+            return;
+        }
+
+        for(int i = 0; i < formula.num_clauses; i++) {
+            std::vector<int> &clause = formula.clauses[i];
+            int size = clause.size();
+            switch(size) {
+                case 0: {} // Empty clause: Skip 
+                case 1: {  // Unit clause: Watch the only literal
+                    int value = clause[0];
+                    T.watched[std::abs(value)].push_back((value > 0) ? i : -(i + 1));
+                }
+                case 2: {  // Binary clause: Watch both literals
+                    int value1 = clause[0];
+                    int value2 = clause[1];
+
+                    T.watched[std::abs(value1)].push_back((value1 > 0) ? i : -(i + 1));
+                    T.watched[std::abs(value2)].push_back((value2 > 0) ? i : -(i + 1));
+                }
+                default: {  // Choose the two most frequent literals and watch them
+                    int index1, index2 = -1;
+                    double weight1, weight2 = 0;
+
+                    // Determine the two most frequent literals in the clause
+                    for(int i = 0; i < size; i++) {
+                        int index = std::abs(clause[i]);
+                        int weight = V.weight[index];
+
+                        if(index1 == -1) {
+                            index1 = i;
+                            weight1 = weight;
+                        } else if(index2 == -1 || weight > weight2) {
+                            if(weight > weight1) {
+                                index2 = index1;
+                                weight2 = weight1;
+
+                                index1 = i;
+                                weight1 = weight;
+                            } else {
+                                index2 = i;
+                                weight2 = weight;
+                            }
+                        }
+                    }
+
+                    int lit1 = clause[index1];
+                    int lit2 = clause[index2];
+
+                    // Add both literals to watch list
+                    T.watched[std::abs(lit1)].push_back((lit1 > 0) ? i : -(i + 1));
+                    T.watched[std::abs(lit2)].push_back((lit2 > 0) ? i : -(i + 1));
+
+                    // Rearrange CNF such that the two watched literals are first and second respectively
+                    clause[index1] = clause[0];
+                    clause[0] = lit1;
+
+                    clause[index2] = clause[1];
+                    clause[1] = lit2;
+                }
+            }
+        }
     }
 }
 
@@ -1176,8 +1235,8 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
 
         // Initializes and toggles TWL
         TWL T;
-        if(TWL_mode == 1) {
-            initTWL(T, reformat_formula);
+        if(TWL_mode != 0) {
+            initTWL(T, reformat_formula, V, TWL_mode);
             T.active = true;
         }
 
