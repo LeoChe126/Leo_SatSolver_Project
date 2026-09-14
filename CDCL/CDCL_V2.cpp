@@ -18,10 +18,16 @@
  *      Created a tracker for clause deletion using activity scores (similar to VSIDS)
  *      Implemented a two-watched-literals scheme for unit propagation
  *      Hijacked assignments[0] to keep track of total # of currently assigned literals
+ * 
+ * 
+ * Current major TODO list:
+ *      Try implementing a WalkSAT based heuristic
+ *      Create a new version of clause culling that also accounts for clause size (maybe scale activity by 1 + 1/size?)
+ *      Test the new version of two-watched-literals and record data
  */
 
 /* General comments:
- * A lot of the indices for the vectors (notably assignments and assignment_level) are indexed by literal.
+ * A lot of the indices for the vectors (notably assignments and assignment_level) are indexed by literal. The total number of assignments is stored at index 0.
  * Example 1: The literal "1" would have its value stored at assignment[1] and its trail level at assignment_level[1].
  * Example 2: The literal "-3" would have its value stored at assignment[3] and its trail level at assignment_level[3].
  * 
