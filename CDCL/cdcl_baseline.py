@@ -76,18 +76,13 @@ class CDCLSolver:
         self.decision_level = 0
         self.decisions = []
 
-        # Counters that tracks decisions, conflicts, propagations, and learned clauses
-        self.num_decisions = 0
-        self.num_conflicts = 0 
-        self.num_propagations = 0 
-        self.num_learned_clauses = 0
-
-
         # Change 4: occurrence map (var -> clause indices) 
         self.occ = {}
+        self.lit_occ = {} # list of literal occurences count for smart heuristics
         for idx, clause in enumerate(self.clauses):
             for lit in clause:
                 self.occ.setdefault(abs(lit), []).append(idx)
+                self.lit_occ.setdefault(lit, []).append(idx)
 
     def assign(self, var, val):
         # Single place where assignment bookkeeping happens
@@ -109,17 +104,12 @@ class CDCLSolver:
         self.num_assigned = 0
         self.trail = []
         self.decisions = []
-        self.num_decisions = 0
-        self.num_conflicts = 0
-        self.num_propagations = 0
-        self.num_learned_clauses = 0
 
         # One full scan to catch original unit clauses, then queue-driven
         conflict = self.initial_propagate()
 
         while True:
             if conflict is not None:
-                self.num_conflicts += 1 # counter for conflicts detected
                 # Conflict detected
                 if self.decision_level == 0:
                     return False
@@ -147,11 +137,22 @@ class CDCLSolver:
                     return True
 
                 # Choose next variable to branch on
+                '''
                 var = self.choose_variable()
                 self.decision_level += 1
-                self.num_decisions += 1 # increment counter per decisions made (counts only branching guesses)
                 self.assign(var, True)
                 self.decisions.append(var)
+                conflict = self.propagate([var])
+                '''
+                lit = self.choose_literal()
+
+                var = abs(lit)
+                value = lit > 0
+
+                self.decision_level += 1
+                self.assign(var, value)
+                self.decisions.append(var)
+
                 conflict = self.propagate([var])
 
     def initial_propagate(self):
@@ -164,7 +165,6 @@ class CDCLSolver:
             if status == 'UNIT':
                 v = abs(unit_lit)
                 if self.value[v] is None:
-                    self.num_propagations += 1 # counter for propagations made, counts implied assignments
                     self.assign(v, unit_lit > 0)
                     queue.append(v)
         return self.propagate(queue)
@@ -184,7 +184,6 @@ class CDCLSolver:
                 if status == 'UNIT':
                     v = abs(unit_lit)
                     if self.value[v] is None:
-                        self.num_propagations += 1 # counter for propagations made, counts implied assignments
                         self.assign(v, unit_lit > 0)
                         queue.append(v)
 
@@ -226,12 +225,12 @@ class CDCLSolver:
             else:
                 learned.append(d)
         self.clauses.append(learned)
-        self.num_learned_clauses += 1 # counter for learned clauses 
 
         # Register the learned clause in the occurrence map
         idx = len(self.clauses) - 1
         for lit in learned:
             self.occ.setdefault(abs(lit), []).append(idx)
+            self.lit_occ.setdefault(lit, []).append(idx) # important for smart heuristics, otherwise it will ignore the learned clause
 
         # backjump: second-highest decision level in the learned clause
         levels = set()
@@ -249,6 +248,7 @@ class CDCLSolver:
         while self.trail and self.level[self.trail[-1]] > level:
             var = self.trail.pop()
             self.value[var] = None
+            self.level[var] = 0
             self.num_assigned -= 1
 
         # Same suffix property holds for decisions
@@ -257,6 +257,86 @@ class CDCLSolver:
 
     def num_variables(self):
         return self.n
+
+    def choose_literal(self):
+        best_lit = None
+        best_count = -1
+        best_pressure = -1.0
+
+        for lit in self.lit_occ:
+            var = abs(lit)
+
+            # Only branch on unassigned variables
+            if self.value[var] is not None:
+                continue
+
+            # DLIS score: how many unresolved clauses contain this signed literal?
+            count = 0
+
+            for idx in self.lit_occ.get(lit, []):
+                clause = self.clauses[idx]
+                status, _ = self.check_clause(clause)
+
+                if status != 'SAT':
+                    count += 1
+
+            # Tie-breaker: opposite-polarity residual pressure
+            pressure = self.residual_pressure(lit)
+
+            if count > best_count:
+                best_lit = lit
+                best_count = count
+                best_pressure = pressure
+
+            elif count == best_count:
+                if pressure > best_pressure:
+                    best_lit = lit
+                    best_pressure = pressure
+            
+        if best_lit is None:
+            var = self.choose_variable()
+            return var
+
+        return best_lit
+
+    def residual_pressure(self, chosen_lit):
+        pressure = 0.0
+        opposite = -chosen_lit
+
+        for idx in self.lit_occ.get(opposite, []):
+            clause = self.clauses[idx]
+
+            # Skip clauses already satisfied by the current assignment
+            status, _ = self.check_clause(clause)
+
+            if status == 'SAT':
+                continue
+
+            remaining_size = 0
+
+            for lit in clause:
+                if lit == opposite:
+                    continue
+
+                var = abs(lit)
+                val = self.value[var]
+
+                if val is None:
+                    remaining_size += 1
+                elif val == (lit > 0):
+                    # Clause is already satisfied; ignore it
+                    remaining_size = None
+                    break
+
+            if remaining_size is None:
+                continue
+
+            # If choosing chosen_lit makes the opposite clause shorter,
+            # shorter residual clauses get higher pressure.
+            if remaining_size > 0:
+                pressure += 2 ** (-remaining_size)
+
+        return pressure
 
 
 if __name__ == "__main__":
@@ -285,23 +365,15 @@ if __name__ == "__main__":
     if not files:
         print(f"ERROR: No .cnf files found in {benchmark_folder}")
         sys.exit(1)
-    
+
     times = []
-
-    decision_counts = []
-    conflict_counts = []
-    propagation_counts = []
-    learned_clause_counts = []
-
     sat_count = 0
     unsat_count = 0
     solved_count = 0
-    
     csv_file = None
     if output_csv is not None:
         csv_file = open(output_csv, "w")
-        #csv_file.write("file,time,verdict\n")
-        csv_file.write("file,time,verdict,decisions,conflicts,propagations,learned_clauses\n")
+        csv_file.write("file,time,verdict\n")
 
     print(f"Benchmark folder: {benchmark_folder}")
     print(f"Found {len(files)} CNF files.")
@@ -321,12 +393,6 @@ if __name__ == "__main__":
             elapsed = time.perf_counter() - start
 
             times.append(elapsed)
-
-            decision_counts.append(solver.num_decisions)
-            conflict_counts.append(solver.num_conflicts)
-            propagation_counts.append(solver.num_propagations)
-            learned_clause_counts.append(solver.num_learned_clauses)
-
             solved_count += 1
 
             if result:
@@ -336,24 +402,11 @@ if __name__ == "__main__":
                 verdict = "UNSATISFIABLE"
                 unsat_count += 1
 
-            print(
-                f"{filepath},{elapsed},{verdict},"
-                f"{solver.num_decisions},"
-                f"{solver.num_conflicts},"
-                f"{solver.num_propagations},"
-                f"{solver.num_learned_clauses}"
-            )
+            print(f"{filepath},{elapsed},{verdict}")
 
             if csv_file is not None:
-                #csv_file.write(
-                #    f"{filepath},{elapsed},{verdict}\n"
-                #)
                 csv_file.write(
-                    f"{filepath},{elapsed},{verdict},"
-                    f"{solver.num_decisions},"
-                    f"{solver.num_conflicts},"
-                    f"{solver.num_propagations},"
-                    f"{solver.num_learned_clauses}\n"
+                    f"{filepath},{elapsed},{verdict}\n"
                 )
 
         except Exception as e:
@@ -374,45 +427,14 @@ if __name__ == "__main__":
         max_time = max(times)
         avg_time = sum(times) / len(times)
 
-        avg_decisions = sum(decision_counts) / len(decision_counts)
-        avg_conflicts = sum(conflict_counts) / len(conflict_counts)
-        avg_propagations = sum(propagation_counts) / len(propagation_counts)
-        avg_learned_clauses = sum(learned_clause_counts) / len(learned_clause_counts)
-
-        #print(f"num solved: {solved_count}")
+        print(f"num solved: {solved_count}")
         print(f"min time: {min_time}")
         print(f"max time: {max_time}")
         print(f"avg time: {avg_time}")
 
         print()
-        print(f"avg decisions: {avg_decisions}")
-        print(f"avg conflicts: {avg_conflicts}")
-        print(f"avg propagations: {avg_propagations}")
-        print(f"avg learned clauses: {avg_learned_clauses}")
-
-        print()
         print(f"SAT count: {sat_count}")
         print(f"UNSAT count: {unsat_count}")
-
-        # full output
-        '''
-        print()
-        print(f"min decisions: {min(decision_counts)}")
-        print(f"max decisions: {max(decision_counts)}")
-        print(f"avg decisions: {sum(decision_counts) / len(decision_counts)}")
-
-        print(f"min conflicts: {min(conflict_counts)}")
-        print(f"max conflicts: {max(conflict_counts)}")
-        print(f"avg conflicts: {sum(conflict_counts) / len(conflict_counts)}")
-
-        print(f"min propagations: {min(propagation_counts)}")
-        print(f"max propagations: {max(propagation_counts)}")
-        print(f"avg propagations: {sum(propagation_counts) / len(propagation_counts)}")
-
-        print(f"min learned clauses: {min(learned_clause_counts)}")
-        print(f"max learned clauses: {max(learned_clause_counts)}")
-        print(f"avg learned clauses: {sum(learned_clause_counts) / len(learned_clause_counts)}")
-        '''
 
     else:
         print("No benchmark instances were solved.")
