@@ -24,6 +24,7 @@
  *      Try implementing a WalkSAT based heuristic
  *      Create a new version of clause culling that also accounts for clause size (maybe scale activity by 1 + 1/size?)
  *      Test the new version of two-watched-literals and record data
+ *      Implement clause minimization?
  */
 
 /* General comments:
