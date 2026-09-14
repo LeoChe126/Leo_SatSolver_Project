@@ -728,7 +728,8 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
 
     std::string benchmarkFolder = argv[1];
 
-    bool writeCSV = (argc == 3);
+    // bool writeCSV = (argc == 3);
+    bool writeCSV = (argc >= 3);
     int heuristic_mode = (argc == 4 ? std::atoi(argv[3]) : 0);
     std::ofstream csv;
 
@@ -765,7 +766,8 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
     int totalBacktrack = 0;
     int totalResolutions = 0;
 
-    const int NUM_FILES = 10;
+    const int NUM_FILES = -1; // run all files 
+    // const int NUM_FILES = 10; 
 
     for (const auto& filePath : files) {
         std::string filename = filePath.string();
@@ -823,7 +825,8 @@ int main(int argc, char* argv[]) { // ChatGPT helped with capturing timing info
         // std::cout << "Assignment validity: " << verifyAssignments(reformat_formula, assignments, formula.num_clauses) << std::endl;
         // printAssignments(assignments, key);
 
-        if(numSolved != -1 && numSolved >= NUM_FILES) break;
+        //if(numSolved != -1 && numSolved >= NUM_FILES) break;
+        if(NUM_FILES != -1 && numSolved >= NUM_FILES) break;
     }
 
     if (writeCSV) {
