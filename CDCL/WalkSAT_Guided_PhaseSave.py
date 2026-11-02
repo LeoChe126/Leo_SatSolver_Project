@@ -62,7 +62,6 @@ def clause_satisfied_by_assignment(clause, assignment):
 
     return False
 
-
 def count_unsatisfied_clauses(clauses, assignment):
     count = 0
     unsat_indices = []
@@ -152,8 +151,30 @@ class CDCLSolver:
         self.num_conflicts = 0
         self.num_propagations = 0
         self.num_learned = 0
+        # Clause minimization counter
+        self.num_clause_literals_removed = 0
+
+        # for UNSAT optimization
+        self.num_restarts = 0 # CDCL restart
+
 
         self.clauses = clauses
+
+        # for clause reduction
+        self.active = [True] * len(self.clauses)
+        self.clause_is_learned = [False] * len(self.clauses)
+        self.clause_activity = [0.0] * len(self.clauses)
+        self.learned_clause_indices = []
+        self.clause_id_to_index = {id(clause): idx for idx, clause in enumerate(self.clauses)}
+
+        self.num_clause_reductions = 0
+        self.num_deleted_clauses = 0
+
+        # Tune later
+        self.reduce_interval = 1000 
+
+        #LBD calculation
+        self.clause_lbd = [0] * len(self.clauses)
 
         #implementing two watched variables 
         self.watch1 = [-1] * len(self.clauses)
@@ -227,33 +248,16 @@ class CDCLSolver:
         self.trail.append(var)
         self.num_assigned += 1
     
-    """
-    def initial_propagate(self):
-        queue = []
-
-        for clause in self.clauses:
-            status, unit_lit = self.check_clause(clause)
-
-            if status == 'UNSAT':
-                return clause
-
-            if status == 'UNIT':
-                v = abs(unit_lit)
-                if self.value[v] is None:
-                    self.num_propagations += 1
-                    #self.assign(v, unit_lit > 0, clause)
-                    self.assign_lit(unit_lit, reason=clause)
-                    queue.append(v)
-
-        return self.propagate(queue)
-    """
+   
     def initial_propagate(self): 
         # initial pass for unit clauses before the main ccl loop, still scans all clauses once
         seeds = []
         changed = True 
         while changed: 
             changed = False 
-            for clause in self.clauses: 
+            for ci, clause in enumerate(self.clauses): 
+                if not self.active[ci]: #uses only active clauses.
+                    continue 
                 status, unit_lit = self.check_clause(clause) 
                 
                 if status == 'UNSAT': 
@@ -287,19 +291,27 @@ class CDCLSolver:
                 backtrack_level, learned = self.analyze_conflict(conflict)
                 if backtrack_level < 0:
                     return False
-                
-                """
-                # Add learned clause to the clause database
-                self.clauses.append(learned)
-                learned_idx = len(self.clauses) - 1
-                self.num_learned += 1
 
-                # Update occurrence maps so propagation/heuristics can see the new clause
-                for lit in learned:
-                    self.occ.setdefault(abs(lit), []).append(learned_idx)
-                    self.lit_occ.setdefault(lit, []).append(learned_idx)
-                """
-                learned_idx = self.add_learned_clause(learned) 
+                #learned_idx = self.add_learned_clause(learned) 
+                old_len = len(learned)
+                learned = self.minimize_learned_clause(learned)
+                new_len = len(learned)
+                self.num_clause_literals_removed += old_len - new_len
+                backtrack_level = self.compute_backjump_level(learned)
+                learned_idx = self.add_learned_clause(learned)
+
+                if self.num_conflicts > 0 and self.num_conflicts % self.reduce_interval == 0:
+                    self.reduce_clause_database()
+                '''
+                # for cdcl restart 
+                if self.num_conflicts >= self.next_restart:
+                    self.backtrack(0)
+                    self.decision_level = 0
+                    self.num_restarts += 1
+                    self.next_restart += self.restart_interval
+                    conflict = self.propagate([])
+                    continue
+                '''
 
 
                 # Backjump after learning the clause
@@ -344,36 +356,6 @@ class CDCLSolver:
                 conflict = self.propagate([var])
     
     def propagate(self, seeds): 
-        """
-        queue = list(seeds)
-
-        while queue: 
-            var = queue.pop()
-            for idx in self.occ.get(var, []): 
-                clause = self.clauses[idx]
-                status, unit_lit = self.check_clause(clause)
-                if status == 'UNSAT':
-                    return clause
-
-                if status == 'UNIT': 
-                    v = abs(unit_lit)
-
-                    if self.value[v] is None: 
-                        self.num_propagations += 1
-                        #self.assign(v, unit_lit > 0, clause) # reason = the unit clause
-                        self.assign_lit(unit_lit, reason=clause)
-                        queue.append(v)
-        
-        return None
-        """
-
-
-        # two watched literals propagation
-        """
-        seeds = variable that were just assigned 
-        when a literal becomes true, its negation becomes false 
-        inspect clauses watching the false literal. 
-        """
         queue = list(seeds) 
         while queue: 
             var = queue.pop(0)
@@ -390,6 +372,10 @@ class CDCLSolver:
             watching = list(self.watchlist.get(false_lit, []))
 
             for ci in watching: 
+
+                if not self.active[ci]: #deleted learned clauses may still appear in watchlists, but the solver will ignore them
+                    continue
+
                 clause = self.clauses[ci]
                 w1 = self.watch1[ci]
                 w2 = self.watch2[ci]
@@ -500,6 +486,7 @@ class CDCLSolver:
         """ 
 
         self.num_conflicts += 1
+        self.bump_clause_activity(conflict_clause)
 
         current_level = self.decision_level
 
@@ -562,6 +549,7 @@ class CDCLSolver:
             reason_clause = self.reason[p]
 
             if reason_clause is None:
+                self.bump_clause_activity(reason_clause) # makes recently useful learned clauses less likely to be deleted.
                 raise RuntimeError(
                     "Conflict analysis tried to resolve on a decision variable "
                     "before reaching 1-UIP."
@@ -629,37 +617,6 @@ class CDCLSolver:
     def num_variabes(self): 
         return self.n
 
-    '''
-    def choose_literal(self): 
-        best_lit = None
-        best_count = -1
-        best_pressure = -1.0
-
-        for lit in self.lit_occ: 
-            var = abs(lit)
-            if self.value[var] is not None: continue 
-
-            count = 0 
-            for idx in self.lit_occ.get(lit, []): 
-                status, _ = self.check_clause(self.clauses[idx])
-                if status != 'SAT': 
-                    count += 1
-            
-            pressure = self.residual_pressure(lit)
-            if count > best_count: 
-                best_lit = lit
-                best_count = count 
-                best_pressure = pressure
-            
-            elif count == best_count and pressure > best_pressure: 
-                best_lit = lit
-                best_pressure = pressure 
-            
-            if best_lit is None: 
-                return self.choose_variable()
-            return best_lit 
-    '''
-
     def choose_literal_vsids(self):
         best_var = None
         best_score = -1.0
@@ -716,6 +673,172 @@ class CDCLSolver:
         
         return pressure
     
+    # helper function for clause minimization
+    def minimize_learned_clause(self, learned): 
+        """
+        keep the asserting literal, 
+        which is assumed to be the last literal in the learned clause. 
+        for each non asserting literal, try to remove it if the reason clause is 
+        already covered by variables in the learned clause.
+        This is a simple minimizer helper function that does not remove all possible redundant literals yet, 
+        for the correctness
+        """
+        if len(learned) <= 2:
+            return learned
+        
+        asserting_lit = learned[-1]
+        learned_vars = set(abs(lit) for lit in learned)
+
+        minimized = []
+        for lit in learned[:-1]:
+            var = abs(lit)
+            reason_clause = self.reason[var]
+
+            # Decision literals cannot be minimized using reason clauses
+            if reason_clause is None:
+                minimized.append(lit)
+                continue
+
+            redundant = True
+
+            for rlit in reason_clause:
+                rvar = abs(rlit)
+
+                # Skip the variable we are trying to remove
+                if rvar == var:
+                    continue
+
+                # If the reason depends on a variable not already in learned,
+                # then removing lit may be unsafe.
+                if rvar not in learned_vars:
+                    redundant = False
+                    break
+
+            if not redundant:
+                minimized.append(lit)
+
+        # Always keep asserting literal
+        minimized.append(asserting_lit)
+
+        return minimized
+
+    def compute_backjump_level(self, learned):
+        """
+        Compute the backjump level for a learned clause.
+
+        Assumes learned[-1] is the asserting literal.
+        Backjump level is the highest decision level among all other literals.
+        """
+
+        if not learned:
+            return -1
+
+        asserting_var = abs(learned[-1])
+        backjump_level = 0
+
+        for lit in learned:
+            var = abs(lit)
+
+            if var == asserting_var:
+                continue
+
+            backjump_level = max(backjump_level, self.level[var])
+
+        return backjump_level
+
+    def compute_lbd(self, clause):
+        """
+        LBD/glue score:
+        number of distinct decision levels appearing in this clause.
+        Lower LBD is usually better.
+        """
+        levels = set()
+
+        for lit in clause:
+            v = abs(lit)
+            levels.add(self.level[v])
+
+        return len(levels)
+
+    # helper function for clause activity bumping
+    def bump_clause_activity(self, clause):
+        """
+        Increase activity of a learned clause when it participates in conflict analysis.
+        """
+
+        ci = self.clause_id_to_index.get(id(clause))
+
+        if ci is None:
+            return
+
+        if not self.clause_is_learned[ci]:
+            return
+
+        self.clause_activity[ci] += 1.0
+    
+    # learned clause is “locked” if it is currently the reason for some assignment.
+    def is_locked_clause(self, ci):
+        """
+        A clause is locked if it is currently used as a reason for an assignment.
+        Locked clauses should not be deleted.
+        """
+
+        target_id = id(self.clauses[ci])
+
+        for reason_clause in self.reason:
+            if reason_clause is not None and id(reason_clause) == target_id:
+                return True
+
+        return False
+    
+
+    def reduce_clause_database(self):
+        """
+        Logically delete low-activity learned clauses.
+
+        Simple policy:
+        - never delete original clauses
+        - never delete binary clauses
+        - never delete locked clauses
+        - delete half of remaining learned clauses with lowest activity
+        """
+
+        candidates = []
+
+        for ci in self.learned_clause_indices:
+            if not self.active[ci]:
+                continue
+
+            clause = self.clauses[ci]
+
+            # Keep short clauses because they are usually valuable
+            if len(clause) <= 2:
+                continue
+
+            # Keep glue clauses
+            if self.clause_lbd[ci] <= 2:
+                continue
+
+            # Do not delete clauses currently used as reasons
+            if self.is_locked_clause(ci):
+                continue
+
+            candidates.append(ci)
+
+        if len(candidates) < 10:
+            return
+
+        # Low activity first; for equal activity, delete longer clauses first
+        candidates.sort(key=lambda ci: (-self.clause_lbd[ci], self.clause_activity[ci], -len(self.clauses[ci])))
+
+        delete_count = len(candidates) // 4 #quarter of candidates to delete, can be tuned later. 
+
+        for ci in candidates[:delete_count]:
+            self.active[ci] = False
+            self.num_deleted_clauses += 1
+
+        self.num_clause_reductions += 1
+
     # Additional helper functions (4 below) helping with two watched literals implementation 
     def lit_value(self, lit): 
         # return true if literal is satisfied, false if literal is unsat, None if unassigned. 
@@ -760,36 +883,224 @@ class CDCLSolver:
                 self.watch2[ci] = 0
     
     def add_learned_clause(self, clause):
-        #add learned clause and initialize its two watch lits, return the new clause index
-        self.clauses.append(clause) 
+        """
+        Add learned clause and initialize its two watched literals.
+        Returns the new clause index.
+        """
+
+        self.clauses.append(clause)
         ci = len(self.clauses) - 1
+
         self.watch1.append(-1)
-        self.watch2.append(-1) 
-        if len(clause) == 0: 
-            return ci 
-        
-        self.watch1[ci] = 0 
+        self.watch2.append(-1)
+
+        self.active.append(True)
+        self.clause_is_learned.append(True)
+        self.clause_activity.append(1.0)
+        self.clause_lbd.append(self.compute_lbd(clause))
+        self.learned_clause_indices.append(ci)
+        self.clause_id_to_index[id(clause)] = ci
+
+        if len(clause) == 0:
+            return ci
+
+        self.watch1[ci] = 0
         self.add_watch(clause[0], ci)
 
-        if len(clause) >= 2: 
+        if len(clause) >= 2:
             self.watch2[ci] = 1
             self.add_watch(clause[1], ci)
-        else: 
+        else:
             self.watch2[ci] = 0
-        
+
         self.num_learned += 1
         return ci
 
+def walksat_with_restarts(
+    clauses,
+    num_vars,
+    max_total_steps=1000,
+    restart_after_no_improve=200,
+    noise=0.3,
+    seed=None
+):
+    start_time = time.perf_counter()
+    rng = random.Random(seed)
+
+    global_best_assignment = None
+    global_best_unsat = float("inf")
+
+    total_steps = 0
+    restarts = 0
+    trap_count = 0
+
+    best_found_at_restart = 0
+    best_found_at_step = 0
+    hit_solution = False
+
+    while total_steps < max_total_steps:
+        restarts += 1
+
+        assignment = [None] + [rng.choice([True, False]) for _ in range(num_vars)]
+
+        local_best_unsat, unsat_indices = count_unsatisfied_clauses(clauses, assignment)
+        no_improve_steps = 0
+
+        if local_best_unsat < global_best_unsat:
+            global_best_unsat = local_best_unsat
+            global_best_assignment = assignment[:]
+            best_found_at_restart = restarts
+            best_found_at_step = total_steps
+
+        while total_steps < max_total_steps:
+            current_unsat_count, unsat_indices = count_unsatisfied_clauses(
+                clauses,
+                assignment
+            )
+
+            if current_unsat_count == 0:
+                global_best_assignment = assignment[:]
+                global_best_unsat = 0
+                hit_solution = True
+
+                elapsed = time.perf_counter() - start_time
+
+                stats = {
+                    "walksat_time": elapsed,
+                    "walksat_total_steps": total_steps,
+                    "walksat_restarts": restarts,
+                    "walksat_best_unsat_count": global_best_unsat,
+                    "walksat_hit_solution": int(hit_solution),
+                    "walksat_trap_count": trap_count,
+                    "walksat_best_found_at_restart": best_found_at_restart,
+                    "walksat_best_found_at_step": best_found_at_step,
+                }
+
+                return global_best_assignment, global_best_unsat, stats
+
+            if current_unsat_count < local_best_unsat:
+                local_best_unsat = current_unsat_count
+                no_improve_steps = 0
+
+                if current_unsat_count < global_best_unsat:
+                    global_best_unsat = current_unsat_count
+                    global_best_assignment = assignment[:]
+                    best_found_at_restart = restarts
+                    best_found_at_step = total_steps
+            else:
+                no_improve_steps += 1
+
+            if no_improve_steps >= restart_after_no_improve:
+                trap_count += 1
+                break
+
+            clause_idx = rng.choice(unsat_indices)
+            clause = clauses[clause_idx]
+
+            if rng.random() < noise:
+                lit = rng.choice(clause)
+                flip_var = abs(lit)
+
+            else:
+                best_flip_var = None
+                best_flip_unsat = float("inf")
+
+                for lit in clause:
+                    var = abs(lit)
+
+                    assignment[var] = not assignment[var]
+                    new_unsat_count, _ = count_unsatisfied_clauses(clauses, assignment)
+                    assignment[var] = not assignment[var]
+
+                    if new_unsat_count < best_flip_unsat:
+                        best_flip_unsat = new_unsat_count
+                        best_flip_var = var
+
+                flip_var = best_flip_var
+
+            assignment[flip_var] = not assignment[flip_var]
+            total_steps += 1
+
+    elapsed = time.perf_counter() - start_time
+
+    if global_best_assignment is None:
+        global_best_assignment = [None] + [rng.choice([True, False]) for _ in range(num_vars)]
+
+    stats = {
+        "walksat_time": elapsed,
+        "walksat_total_steps": total_steps,
+        "walksat_restarts": restarts,
+        "walksat_best_unsat_count": global_best_unsat,
+        "walksat_hit_solution": int(hit_solution),
+        "walksat_trap_count": trap_count,
+        "walksat_best_found_at_restart": best_found_at_restart,
+        "walksat_best_found_at_step": best_found_at_step,
+    }
+
+    return global_best_assignment, global_best_unsat, stats
+
+"""
+def walksat_multistart_phase( #################
+    clauses,
+    num_vars,
+    trials=8,
+    max_total_steps=1000,
+    restart_after_no_improve=200,
+    noise=0.3,
+    seed=None
+):
+    best_assignment = None
+    best_unsat = float("inf")
+    best_stats = None
+
+    base_seed = 0 if seed is None else seed
+
+    for t in range(trials):
+        assignment, unsat_count, stats = walksat_with_restarts(
+            clauses,
+            num_vars,
+            max_total_steps=max_total_steps,
+            restart_after_no_improve=restart_after_no_improve,
+            noise=noise,
+            seed=base_seed + 1009 * t
+        )
+
+        if unsat_count < best_unsat:
+            best_unsat = unsat_count
+            best_assignment = assignment
+            best_stats = stats
+
+        if best_unsat == 0:
+            break
+
+    best_stats = dict(best_stats)
+    best_stats["walksat_multistart_trials"] = trials
+
+    return best_assignment, best_unsat, best_stats
+"""
+
 
 #Helper functions to solve a single file and adding timeout per file for large datasat (UF/UUF 250-1065) 
-def solve_one_file(args): 
+def solve_one_file(args):
     filepath, mode, file_index = args
 
     with open(filepath) as f:
         num_vars, clauses = parseFile(f.read())
 
     initial_assignment = None
-    walksat_unsat_count = ""
+
+    walksat_stats = {
+        "walksat_time": "",
+        "walksat_total_steps": "",
+        "walksat_restarts": "",
+        "walksat_best_unsat_count": "",
+        "walksat_hit_solution": "",
+        "walksat_trap_count": "",
+        "walksat_best_found_at_restart": "",
+        "walksat_best_found_at_step": "",
+    }
+
+    full_start = time.perf_counter()
 
     if mode == "baseline":
         initial_assignment = None
@@ -798,14 +1109,26 @@ def solve_one_file(args):
         initial_assignment = random_phase_assignment(num_vars, seed=file_index)
 
     elif mode == "walksat":
-        initial_assignment, walksat_unsat_count = walksat(
+        
+        initial_assignment, walksat_unsat_count, walksat_stats = walksat_with_restarts(
             clauses,
             num_vars,
-            max_steps=1000,
+            max_total_steps=1000,
+            restart_after_no_improve=200,
             noise=0.3,
             seed=file_index
         )
-
+        """
+        initial_assignment, walksat_unsat_count, walksat_stats = walksat_multistart_phase(
+            clauses,
+            num_vars,
+            trials=8,
+            max_total_steps=1000,
+            restart_after_no_improve=200,
+            noise=0.3,
+            seed=file_index
+        )
+        """
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -815,22 +1138,44 @@ def solve_one_file(args):
         initial_phase_assignment=initial_assignment
     )
 
-    start = time.perf_counter()
+    cdcl_start = time.perf_counter()
     result = solver.solve()
-    elapsed = time.perf_counter() - start
+    cdcl_time = time.perf_counter() - cdcl_start
+
+    total_time = time.perf_counter() - full_start
 
     verdict = "SATISFIABLE" if result else "UNSATISFIABLE"
 
     return {
         "file": filepath,
         "mode": mode,
-        "time": elapsed,
+        "time": cdcl_time,
+        "cdcl_time": cdcl_time,
+        "total_time": total_time,
         "verdict": verdict,
+
         "decisions": solver.num_decisions,
         "conflicts": solver.num_conflicts,
         "propagations": solver.num_propagations,
         "learned": solver.num_learned,
-        "walksat_unsat_count": walksat_unsat_count,
+
+        # Clause minimization/deletion counters
+        "clause_literals_removed": solver.num_clause_literals_removed,
+        "clause_reductions": solver.num_clause_reductions,
+        "deleted_clauses": solver.num_deleted_clauses,
+
+        # WalkSAT counters
+        "walksat_time": walksat_stats["walksat_time"],
+        "walksat_total_steps": walksat_stats["walksat_total_steps"],
+        "walksat_restarts": walksat_stats["walksat_restarts"],
+        "walksat_best_unsat_count": walksat_stats["walksat_best_unsat_count"],
+        "walksat_hit_solution": walksat_stats["walksat_hit_solution"],
+        "walksat_trap_count": walksat_stats["walksat_trap_count"],
+        "walksat_best_found_at_restart": walksat_stats["walksat_best_found_at_restart"],
+        "walksat_best_found_at_step": walksat_stats["walksat_best_found_at_step"],
+
+        #CDCL restart counter
+        "restarts": solver.num_restarts,
     }
 
 def solve_one_file_with_timeout(filepath, mode, file_index, timeout_seconds):
@@ -851,12 +1196,29 @@ def solve_one_file_with_timeout(filepath, mode, file_index, timeout_seconds):
                 "file": filepath,
                 "mode": mode,
                 "time": "",
+                "cdcl_time": "",
+                "total_time": "",
                 "verdict": "TIMEOUT",
+
                 "decisions": "",
                 "conflicts": "",
                 "propagations": "",
                 "learned": "",
-                "walksat_unsat_count": "",
+                "restarts": "",
+
+                "clause_literals_removed": "",
+                "clause_reductions": "",
+                "deleted_clauses": "",
+
+                "walksat_time": "",
+                "walksat_total_steps": "",
+                "walksat_restarts": "",
+                "walksat_best_unsat_count": "",
+                "walksat_hit_solution": "",
+                "walksat_trap_count": "",
+                "walksat_best_found_at_restart": "",
+                "walksat_best_found_at_step": "",
+
             }
 
 if __name__ == "__main__": # LLM implemented this based on my old version
@@ -879,83 +1241,21 @@ if __name__ == "__main__": # LLM implemented this based on my old version
     files = sorted(os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".cnf"))
     if not files:
         print(f"ERROR: no .cnf in {folder}"); sys.exit(1)
-    """
-    times = []; sat = unsat = 0
-    tot_conf = tot_dec = tot_prop = tot_learn = 0
-    csv_file = open(output_csv, "w") if output_csv else None
-    if csv_file:
-        #csv_file.write("file,time,verdict,decisions,conflicts,propagations,learned\n")
-        csv_file.write("file,mode,time,verdict,decisions,conflicts,propagations,learned,walksat_unsat\n")
-    print(f"Benchmark folder: {folder}\nFound {len(files)} CNF files.\n")
-    
-    for file_index, filepath in enumerate(files):
-        try:
-            with open(filepath) as f:
-                num_vars, clauses = parseFile(f.read())
-            
-            initial_assignment = None
-            walksat_unsat = ""
 
-            if mode == "baseline":
-                initial_assignment = None
-
-            elif mode == "random": 
-                initial_assignment = random_phase_assignment(num_vars, seed=0)
-
-            elif mode == "walksat":
-                initial_assignment, walksat_unsat_count = walksat(
-                    clauses,
-                    num_vars,
-                    max_steps=1000,
-                    noise=0.3,
-                    seed=0
-                )
-                walksat_unsat = walksat_unsat_count
-
-            solver = CDCLSolver(
-                clauses,
-                num_vars,
-                initial_phase_assignment=initial_assignment
-            )
-
-            start = time.perf_counter()
-            result = solver.solve()
-            elapsed = time.perf_counter() - start
-            times.append(elapsed)
-
-            if result: 
-                verdict = "SATISFIABLE"
-            else: 
-                verdict = "UNSATISFIABLE"
-            
-            if result: 
-                sat += 1
-            else:
-                unsat += 1
-
-            tot_conf += solver.num_conflicts
-            tot_dec += solver.num_decisions
-
-            tot_prop += solver.num_propagations
-            tot_learn += solver.num_learned
-
-            print(f"{filepath},{elapsed:.6f},{verdict}")
-            if csv_file:
-                csv_file.write(f"{filepath},{mode},{elapsed:.6f},{verdict},"
-                                f"{solver.num_decisions},{solver.num_conflicts},"
-                                f"{solver.num_propagations},{solver.num_learned}"
-                                f",{walksat_unsat}\n")
-        except Exception as e:
-            print(f"ERROR processing {filepath}: {e}")
-            if csv_file: csv_file.write(f"{filepath},,ERROR,,,,\n")
-    """
     times = []
     sat = unsat = timeouts = errors = 0
     tot_conf = tot_dec = tot_prop = tot_learn = 0
 
     csv_file = open(output_csv, "w") if output_csv else None
     if csv_file:
-        csv_file.write("file,mode,time,verdict,decisions,conflicts,propagations,learned,walksat_unsat_count\n")
+        csv_file.write(
+            "file,mode,cdcl_time,total_time,verdict,"
+            "decisions,conflicts,propagations,learned,restarts,"
+            "clause_literals_removed,clause_reductions,deleted_clauses,"
+            "walksat_time,walksat_total_steps,walksat_restarts,"
+            "walksat_best_unsat_count,walksat_hit_solution,walksat_trap_count,"
+            "walksat_best_found_at_restart,walksat_best_found_at_step\n"
+        )
 
     print(f"Benchmark folder: {folder}")
     print(f"Found {len(files)} CNF files.")
@@ -976,10 +1276,12 @@ if __name__ == "__main__": # LLM implemented this based on my old version
 
             if csv_file:
                 csv_file.write(
-                    f"{row['file']},{row['mode']},{row['time']},{row['verdict']},"
-                    f"{row['decisions']},{row['conflicts']},"
-                    f"{row['propagations']},{row['learned']},"
-                    f"{row['walksat_unsat_count']}\n"
+                    f"{row.get('file','')},{row.get('mode','')},{row.get('cdcl_time','')},{row.get('total_time','')},{row.get('verdict','')},"
+                    f"{row.get('decisions','')},{row.get('conflicts','')},{row.get('propagations','')},{row.get('learned','')},{row.get('restarts','')},"
+                    f"{row.get('clause_literals_removed','')},{row.get('clause_reductions','')},{row.get('deleted_clauses','')},"
+                    f"{row.get('walksat_time','')},{row.get('walksat_total_steps','')},{row.get('walksat_restarts','')},"
+                    f"{row.get('walksat_best_unsat_count','')},{row.get('walksat_hit_solution','')},{row.get('walksat_trap_count','')},"
+                    f"{row.get('walksat_best_found_at_restart','')},{row.get('walksat_best_found_at_step','')}\n"
                 )
                 csv_file.flush()
 
@@ -1039,26 +1341,7 @@ if __name__ == "__main__": # LLM implemented this based on my old version
 
     if output_csv:
         print(f"\nResults written to {output_csv}")
-    """
-    if csv_file: csv_file.close()
-    n = len(times)
-    print()
-    if n:
-        print(f"num solved: {n}")
-        print(f"min time: {min(times):.6f}")
-        print(f"max time: {max(times):.6f}")
-        print(f"avg time: {sum(times)/n:.6f}")
-        print()
-        print(f"avg decisions:    {tot_dec/n:.3f}")
-        print(f"avg conflicts:    {tot_conf/n:.3f}")
-        print(f"avg propagations: {tot_prop/n:.3f}")
-        print(f"avg learned:      {tot_learn/n:.3f}")
-        print()
-        print(f"SAT count: {sat}")
-        print(f"UNSAT count: {unsat}")
-    if output_csv:
-        print(f"\nResults written to {output_csv}")
-    """
+
     
 
 

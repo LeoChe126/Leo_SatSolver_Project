@@ -1,0 +1,3 @@
+[submodule "QuICC-SAT-Datasets"]
+	path = QuICC-SAT-Datasets
+	url = https://github.com/UMD-ARLIS/QuICC-SAT-Datasets.git

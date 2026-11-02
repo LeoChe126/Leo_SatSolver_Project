@@ -1,0 +1,11 @@
+file,time,verdict
+benchmarks/uf50-218/uf50-0100.cnf,0.0147,SATISFIABLE
+benchmarks/uf50-218/uf50-0101.cnf,0.0153,SATISFIABLE
+benchmarks/uf50-218/uf50-0102.cnf,0.0057,SATISFIABLE
+benchmarks/uf50-218/uf50-0103.cnf,0.0017,SATISFIABLE
+benchmarks/uf50-218/uf50-0104.cnf,0.0561,SATISFIABLE
+benchmarks/uf50-218/uf50-0105.cnf,0.0105,SATISFIABLE
+benchmarks/uf50-218/uf50-0106.cnf,0.0350,SATISFIABLE
+benchmarks/uf50-218/uf50-0107.cnf,0.0623,SATISFIABLE
+benchmarks/uf50-218/uf50-0108.cnf,0.0093,SATISFIABLE
+benchmarks/uf50-218/uf50-0109.cnf,0.0304,SATISFIABLE
