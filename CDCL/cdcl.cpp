@@ -1,15 +1,30 @@
-// cdcl.cpp
-// Faithful C++ translation of cdcl.py (complete CDCL solver).
-// Preserves every trick: two-watched-literal propagation, 1-UIP conflict
-// analysis, recursive clause minimization, LBD-based clause-DB reduction,
-// Luby restarts, EVSIDS (ratio 1.05) with frequency-based initialization,
-// and phase saving. Counters are kept identical to the Python version
-// (propagation counted once per literal processed = MiniSat-aligned).
+// cdcl_v1.cpp -- Stage 1: algorithmic fixes on top of cdcl.cpp (v0)
+// 
+//   [S1.1] VSIDS rescale is magnitude-triggered (increment > 1e100), not
+//          every 1250 bumps. The old schedule divided by 1e100 while the
+//          increment had only grown ~1e26, so activities underflowed to 0.
+//   [S1.2] Watch lists are a vector<vector<int>> indexed by literal code
+//          (2*v for +v, 2*v+1 for -v) instead of an unordered_map.
+//   [S1.3] No per-conflict heap allocations: seen/touched flags, LBD level
+//          marks, minimization marks and the propagation queue are reusable
+//          members. std::function / unordered_set / unordered_map removed.
+//   [S1.4] Clause activity is bumped by a growing cla_inc and decays each
+//          conflict (MiniSat style, decay 0.999), with rescale at 1e20.
+//   [S1.5] Clause-DB reduction physically frees deleted clauses, removes
+//          them from every watch list and from learned_clause_indices.
+//   [S1.6] Learned clauses are watched correctly: the asserting literal is
+//          moved to position 0 and the highest-level other literal to
+//          position 1 before watching. v0 stored the asserting literal LAST
+//          but watched positions 0 and 1, i.e. two FALSE literals, so the
+//          clause often missed later propagations/conflicts (still sound,
+//          because original clauses are watched correctly, but much weaker).
 //
-// Build:  g++ -std=c++17 -O2 -o cdcl cdcl.cpp
-//         (no -lstdc++fs needed: directory listing uses POSIX dirent, which
-//          works on any GCC without extra link flags)
-// Run:    ./cdcl <benchmark_folder> [output_csv]
+// Search behaviour (decisions, restarts, learning, minimization, reduction
+// policy) is otherwise unchanged from v0.
+//
+// Build:  g++ -std=c++17 -O2 -o cdcl_v1 cdcl_v1.cpp
+// Run:    ./cdcl_v1 <benchmark_folder> [output_csv]
+//         env CDCL_MAX_CONFLICTS=N gives up on an instance after N conflicts
 
 #include <iostream>
 #include <cstdlib>
@@ -18,23 +33,19 @@
 #include <vector>
 #include <string>
 #include <dirent.h>
-#include <unordered_map>
-#include <unordered_set>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cmath>
-#include <functional>
 #include <limits>
 
-// ------------------------- DIMACS parsing (ports parseFile) ----------------
+// ------------------------- DIMACS parsing ---------------------------------
 static int parseFile(const std::string& text, std::vector<std::vector<int>>& clauses) {
     int num_vars = 0;
     std::vector<int> tokens;
     std::istringstream all(text);
     std::string line;
     while (std::getline(all, line)) {
-        // strip trailing '\r' and surrounding whitespace
         size_t a = line.find_first_not_of(" \t\r\n");
         if (a == std::string::npos) continue;
         size_t b = line.find_last_not_of(" \t\r\n");
@@ -65,8 +76,10 @@ static int parseFile(const std::string& text, std::vector<std::vector<int>>& cla
     return num_vars;
 }
 
-// Clause status codes (mirror the ('SAT'|'UNSAT'|'UNIT'|'UNRESOLVED') tuple).
 enum { ST_SAT = 0, ST_UNSAT = 1, ST_UNIT = 2, ST_UNRESOLVED = 3 };
+
+// [S1.2] literal -> dense index for watch lists
+static inline int lidx(int lit) { return lit > 0 ? 2 * lit : 2 * (-lit) + 1; }
 
 struct CDCLSolver {
     // ---- counters ----
@@ -83,25 +96,29 @@ struct CDCLSolver {
     std::vector<std::vector<int>> clauses;
 
     // assignment state. value: -1 unassigned, 0 false, 1 true.
-    std::vector<int> value;      // indexed by var, value[var] in {-1,0,1}
-    std::vector<int> level;      // decision level per var
-    std::vector<int> reason;     // clause index that forced var, -1 = decision/none
+    std::vector<int> value;
+    std::vector<int> level;
+    std::vector<int> reason;     // clause index, -1 = decision/none
     int num_assigned = 0;
     std::vector<int> trail;
     int decision_level = 0;
 
     // watched literals
-    std::vector<char> active;    // per clause
-    std::vector<int> watch1;     // index of 1st watched literal inside clause
-    std::vector<int> watch2;     // index of 2nd watched literal inside clause
-    std::unordered_map<int, std::vector<int>> watchlist;  // lit -> clause indices
+    std::vector<char> active;
+    std::vector<int> watch1;
+    std::vector<int> watch2;
+    std::vector<std::vector<int>> watchlist;   // [S1.2] indexed by lidx(lit)
 
     // clause metadata for LBD reduction
     std::vector<char> clause_is_learned;
     std::vector<double> clause_activity;
     std::vector<int> clause_lbd;
     std::vector<int> learned_clause_indices;
-    long long conflict_budget = 0;   // 0 = unlimited; else give up after this many conflicts
+    long long conflict_budget = 0;
+
+    // [S1.4] clause activity with decay
+    double cla_inc = 1.0;
+    double cla_decay = 0.999;
 
     // Luby restarts
     long long restart_base = 100;
@@ -116,11 +133,23 @@ struct CDCLSolver {
     // VSIDS
     double vsids_increment = 0.5;
     double vsids_ratio = 1.05;
-    long long vsids_num_increments = 0;
-    long long vsids_rescale = 1250;
-    double vsids_rescale_ratio = 1e100;
-    std::vector<double> activity;   // activity[v]
-    std::vector<int> phase;         // 0 none, 1 last true, -1 last false
+    double vsids_rescale_limit = 1e100;        // [S1.1]
+    std::vector<double> activity;
+    std::vector<int> phase;
+
+    // [S1.3] reusable scratch buffers
+    std::vector<int>  prop_queue;              // propagation FIFO
+    std::vector<char> seen;                    // analyze: on implication path
+    std::vector<char> touched_flag;            // analyze: var already in touched
+    std::vector<int>  touched;                 // analyze: vars to bump
+    std::vector<int>  learned_buf;             // analyze: learned clause
+    std::vector<int>  level_stamp;             // LBD: level -> stamp
+    int lbd_stamp = 0;
+    std::vector<int>  in_clause_stamp;         // minimize: var in learned clause
+    std::vector<int>  cache_stamp;             // minimize: cache valid for var
+    std::vector<char> cache_val;               // minimize: 1 redundant, 0 not
+    int min_stamp = 0;
+    std::vector<char> locked_buf;              // reduce: clause is a reason
 
     CDCLSolver(std::vector<std::vector<int>> cls, int num_vars)
         : clauses(std::move(cls)) {
@@ -130,6 +159,7 @@ struct CDCLSolver {
         level.assign(n + 1, 0);
         reason.assign(n + 1, -1);
         trail.reserve(n + 1);
+        watchlist.assign(2 * n + 2, {});
 
         size_t m = clauses.size();
         active.assign(m, 1);
@@ -146,22 +176,28 @@ struct CDCLSolver {
         activity.assign(n + 1, 0.0);
         phase.assign(n + 1, 0);
 
-        // frequency-based VSIDS initialization (count each var once per clause)
-        for (const auto& clause : clauses) {
-            std::unordered_set<int> seen_in_clause;
-            for (int lit : clause) {
+        seen.assign(n + 1, 0);
+        touched_flag.assign(n + 1, 0);
+        level_stamp.assign(n + 2, 0);
+        in_clause_stamp.assign(n + 1, 0);
+        cache_stamp.assign(n + 1, 0);
+        cache_val.assign(n + 1, 0);
+        prop_queue.reserve(n + 1);
+
+        // frequency-based VSIDS initialization (each var once per clause)
+        std::vector<int> mark(n + 1, -1);
+        for (size_t ci = 0; ci < clauses.size(); ++ci) {
+            for (int lit : clauses[ci]) {
                 int v = std::abs(lit);
-                if (seen_in_clause.insert(v).second) activity[v] += 1.0;
+                if (mark[v] != (int)ci) { mark[v] = (int)ci; activity[v] += 1.0; }
             }
         }
     }
 
-    inline int litValue(int lit) {
+    inline int litValue(int lit) const {
         int v = value[std::abs(lit)];
-        if (v < 0) return -1;                 // unassigned
-        bool b = (v == 1);
-        bool res = (lit > 0) ? b : !b;
-        return res ? 1 : 0;
+        if (v < 0) return -1;
+        return ((lit > 0) == (v == 1)) ? 1 : 0;
     }
 
     void assign_lit(int lit, int reason_ci) {
@@ -175,16 +211,7 @@ struct CDCLSolver {
         num_assigned++;
     }
 
-    void add_watch(int lit, int ci) { watchlist[lit].push_back(ci); }
-
-    void remove_watch(int lit, int ci) {
-        auto it = watchlist.find(lit);
-        if (it == watchlist.end()) return;
-        auto& vec = it->second;
-        for (auto j = vec.begin(); j != vec.end(); ++j) {
-            if (*j == ci) { vec.erase(j); return; }
-        }
-    }
+    void add_watch(int lit, int ci) { watchlist[lidx(lit)].push_back(ci); }
 
     void init_watches() {
         for (size_t ci = 0; ci < clauses.size(); ++ci) {
@@ -201,27 +228,21 @@ struct CDCLSolver {
         }
     }
 
-    // returns (status, unit_lit). unit_lit valid only when status==ST_UNIT.
-    std::pair<int,int> check_clause(const std::vector<int>& clause) {
-        std::vector<int> unassigned;
+    // [S1.3] no temporary vector
+    std::pair<int,int> check_clause(const std::vector<int>& clause) const {
+        int num_unassigned = 0, last_unassigned = 0;
         for (int lit : clause) {
-            int v = value[std::abs(lit)];
-            if (v < 0) {
-                unassigned.push_back(lit);
-            } else {
-                bool b = (v == 1);
-                bool litval = (lit > 0) ? b : !b;
-                if (litval) return {ST_SAT, 0};
-            }
+            int lv = litValue(lit);
+            if (lv == 1) return {ST_SAT, 0};
+            if (lv < 0) { num_unassigned++; last_unassigned = lit; }
         }
-        if (unassigned.empty()) return {ST_UNSAT, 0};
-        if (unassigned.size() == 1) return {ST_UNIT, unassigned[0]};
+        if (num_unassigned == 0) return {ST_UNSAT, 0};
+        if (num_unassigned == 1) return {ST_UNIT, last_unassigned};
         return {ST_UNRESOLVED, 0};
     }
 
-    // returns conflicting clause index, or -1 if no conflict.
     int initial_propagate() {
-        std::vector<int> queue;
+        prop_queue.clear();
         for (size_t ci = 0; ci < clauses.size(); ++ci) {
             auto st = check_clause(clauses[ci]);
             if (st.first == ST_UNSAT) return (int)ci;
@@ -229,35 +250,30 @@ struct CDCLSolver {
                 int v = std::abs(st.second);
                 if (value[v] == -1) {
                     assign_lit(st.second, (int)ci);
-                    queue.push_back(v);
+                    prop_queue.push_back(v);
                 }
             }
         }
-        return propagate(queue);
+        return propagate();
     }
 
+    // Propagates everything in prop_queue (caller fills it).
     // returns conflicting clause index, or -1 if no conflict.
-    int propagate(std::vector<int> seeds) {
-        std::vector<int> queue = std::move(seeds);
+    int propagate() {
+        std::vector<int>& queue = prop_queue;
         size_t qi = 0;
         while (qi < queue.size()) {
-            int var = queue[qi++];                 // FIFO (matches queue.pop(0))
+            int var = queue[qi++];
             int val = value[var];
             if (val < 0) continue;
-            num_propagations++;                     // per literal processed
+            num_propagations++;
             int false_lit = (val == 1) ? -var : var;
 
-            auto it = watchlist.find(false_lit);
-            if (it == watchlist.end()) continue;
-            // In-place compaction over the SAME list (MiniSat style): no copy,
-            // no O(k) remove_watch. Dead clauses are dropped lazily. Visiting
-            // order, assignments, and all counters are identical to the copy
-            // version -- only the data-structure bookkeeping changes.
-            std::vector<int>& vec = it->second;
+            std::vector<int>& vec = watchlist[lidx(false_lit)];   // [S1.2]
             size_t i = 0, j = 0, sz = vec.size();
             while (i < sz) {
                 int ci = vec[i];
-                if (!active[ci]) { ++i; continue; }   // drop dead clause from list
+                if (!active[ci]) { ++i; continue; }
                 auto& clause = clauses[ci];
                 int w1 = watch1[ci], w2 = watch2[ci];
                 int lit1 = clause[w1], lit2 = clause[w2];
@@ -265,43 +281,39 @@ struct CDCLSolver {
                 bool updating_watch1;
                 if (lit1 == false_lit) { other_lit = lit2; updating_watch1 = true; }
                 else if (lit2 == false_lit) { other_lit = lit1; updating_watch1 = false; }
-                else { ++i; continue; }               // watch already moved: drop stale ref
+                else { ++i; continue; }
 
                 int other_val = litValue(other_lit);
-                if (other_val == 1) { vec[j++] = ci; ++i; continue; } // keep watch
+                if (other_val == 1) { vec[j++] = ci; ++i; continue; }
 
                 bool moved = false;
                 for (int new_idx = 0; new_idx < (int)clause.size(); ++new_idx) {
                     if (new_idx == w1 || new_idx == w2) continue;
-                    if (litValue(clause[new_idx]) != 0) {   // not False
-                        add_watch(clause[new_idx], ci);     // move to other list
+                    if (litValue(clause[new_idx]) != 0) {
+                        add_watch(clause[new_idx], ci);
                         if (updating_watch1) watch1[ci] = new_idx;
                         else                 watch2[ci] = new_idx;
-                        moved = true;                        // removed from THIS list (skip write)
+                        moved = true;
                         break;
                     }
                 }
                 if (moved) { ++i; continue; }
 
-                if (other_val == 0) {               // both watches false -> conflict
-                    vec[j++] = ci;                   // keep watch (as original did)
-                    ++i;
-                    while (i < sz) vec[j++] = vec[i++];  // preserve unprocessed tail
+                if (other_val == 0) {
+                    vec[j++] = ci; ++i;
+                    while (i < sz) vec[j++] = vec[i++];
                     vec.resize(j);
                     return ci;
-                } else {                            // clause is unit -> assign other_lit
-                    vec[j++] = ci;                   // keep watch
-                    ++i;
+                } else {
+                    vec[j++] = ci; ++i;
                     int unit_var = std::abs(other_lit);
                     if (value[unit_var] == -1) {
                         assign_lit(other_lit, ci);
                         queue.push_back(unit_var);
-                    } else {
-                        if (litValue(other_lit) == 0) {
-                            while (i < sz) vec[j++] = vec[i++];
-                            vec.resize(j);
-                            return ci;
-                        }
+                    } else if (litValue(other_lit) == 0) {
+                        while (i < sz) vec[j++] = vec[i++];
+                        vec.resize(j);
+                        return ci;
                     }
                 }
             }
@@ -310,43 +322,44 @@ struct CDCLSolver {
         return -1;
     }
 
+    // [S1.4] bump by the (growing) increment, rescale on overflow
     void bump_clause_activity(int ci) {
-        if (ci < 0) return;
-        if (!clause_is_learned[ci]) return;
-        clause_activity[ci] += 1.0;
-    }
-
-    void bump_vsids(const std::vector<int>& variables) {
-        if (vsids_num_increments >= vsids_rescale) {
-            vsids_increment /= vsids_rescale_ratio;
-            for (int v = 1; v <= n; ++v) activity[v] /= vsids_rescale_ratio;
-            vsids_num_increments = 0;
+        if (ci < 0 || !clause_is_learned[ci]) return;
+        clause_activity[ci] += cla_inc;
+        if (clause_activity[ci] > 1e20) {
+            for (int lc : learned_clause_indices) clause_activity[lc] *= 1e-20;
+            cla_inc *= 1e-20;
         }
+    }
+    void decay_clause_activity() { cla_inc /= cla_decay; }
+
+    // [S1.1] rescale only when values get large
+    void bump_vsids(const std::vector<int>& variables) {
         for (int v : variables) activity[v] += vsids_increment;
-        vsids_num_increments++;
         vsids_increment *= vsids_ratio;
+        if (vsids_increment > vsids_rescale_limit) {
+            for (int v = 1; v <= n; ++v) activity[v] *= 1e-100;
+            vsids_increment *= 1e-100;
+        }
     }
 
-    // 1-UIP analysis. conflict_ci = conflicting clause index.
-    // Fills out_learned, returns backjump level.
+    // 1-UIP analysis. Fills out_learned, returns backjump level.
     int analyze_conflict(int conflict_ci, std::vector<int>& out_learned) {
         num_conflicts++;
         bump_clause_activity(conflict_ci);
 
         int current_level = decision_level;
-        std::vector<int> learned;
-        std::vector<char> seen(n + 1, 0);
+        std::vector<int>& learned = out_learned;   // [S1.3] caller-owned buffer
+        learned.clear();
+        touched.clear();
         int path_count = 0;
 
-        // touched vars, preserving first-seen order; dedup via a flag array.
-        std::vector<int> touched;
-        std::vector<char> touched_flag(n + 1, 0);
         auto touch = [&](int v) {
             if (!touched_flag[v]) { touched_flag[v] = 1; touched.push_back(v); }
         };
 
-        int clause_ci = conflict_ci;       // index of current clause being resolved
-        int p = 0;                          // 0 means "None" (var ids start at 1)
+        int clause_ci = conflict_ci;
+        int p = 0;
         int trail_index = (int)trail.size() - 1;
 
         while (true) {
@@ -378,20 +391,20 @@ struct CDCLSolver {
             for (int lit : clauses[reason_ci]) touch(std::abs(lit));
         }
 
-        // asserting literal (negation of p's current value)
         if (value[p] == 1) learned.push_back(-p);
         else               learned.push_back(p);
 
         int backjump_level = 0;
-        int asserting_var = p;
         for (int lit : learned) {
             int var = std::abs(lit);
-            if (var == asserting_var) continue;
+            if (var == p) continue;
             if (level[var] > backjump_level) backjump_level = level[var];
         }
 
         bump_vsids(touched);
-        out_learned = std::move(learned);
+        // [S1.3] clear scratch flags in O(touched) instead of reallocating
+        for (int v : touched) { touched_flag[v] = 0; seen[v] = 0; }
+        decay_clause_activity();                   // [S1.4]
         return backjump_level;
     }
 
@@ -399,7 +412,7 @@ struct CDCLSolver {
         while (!trail.empty() && level[trail.back()] > target_level) {
             int var = trail.back();
             trail.pop_back();
-            value[var] = -1;        // phase[var] intentionally preserved
+            value[var] = -1;
             level[var] = 0;
             reason[var] = -1;
             num_assigned--;
@@ -416,7 +429,7 @@ struct CDCLSolver {
                 if (score > best_score) { best_score = score; best_var = var; }
             }
         }
-        if (best_var == 0) return 0;         // none (all assigned)
+        if (best_var == 0) return 0;
         if (phase[best_var] == 0) return -best_var;
         return (phase[best_var] > 0) ? best_var : -best_var;
     }
@@ -424,8 +437,8 @@ struct CDCLSolver {
     long long luby(long long i) {
         long long k = 1;
         while (true) {
-            if (i == ( (1LL << k) - 1 )) return (1LL << (k - 1));
-            else if ( (1LL << (k - 1)) <= i && i < ((1LL << k) - 1) ) {
+            if (i == ((1LL << k) - 1)) return (1LL << (k - 1));
+            else if ((1LL << (k - 1)) <= i && i < ((1LL << k) - 1)) {
                 i = i - (1LL << (k - 1)) + 1;
                 k = 1;
             } else {
@@ -434,10 +447,15 @@ struct CDCLSolver {
         }
     }
 
+    // [S1.3] stamp array instead of unordered_set
     int compute_lbd(const std::vector<int>& clause) {
-        std::unordered_set<int> levels;
-        for (int lit : clause) levels.insert(level[std::abs(lit)]);
-        return (int)levels.size();
+        ++lbd_stamp;
+        int count = 0;
+        for (int lit : clause) {
+            int lv = level[std::abs(lit)];
+            if (level_stamp[lv] != lbd_stamp) { level_stamp[lv] = lbd_stamp; count++; }
+        }
+        return count;
     }
 
     int compute_backjump_level(const std::vector<int>& learned) {
@@ -445,62 +463,70 @@ struct CDCLSolver {
         int asserting_var = std::abs(learned.back());
         int bl = 0;
         for (int lit : learned) {
-            if (std::abs(lit) != asserting_var)
-                if (level[std::abs(lit)] > bl) bl = level[std::abs(lit)];
+            int v = std::abs(lit);
+            if (v != asserting_var && level[v] > bl) bl = level[v];
         }
         return bl;
     }
 
-    // recursive clause minimization (ccmin_mode=2 style), ports minimize_learned_clause
-    std::vector<int> minimize_learned_clause(const std::vector<int>& learned) {
-        if (learned.size() <= 1) return learned;
-        std::unordered_set<int> clause_vars;
-        for (int l : learned) clause_vars.insert(std::abs(l));
-        std::unordered_map<int, char> cache;   // var -> 0/1 (redundant?)
-
-        // returns whether 'lit' is redundant
-        std::function<bool(int)> redundant = [&](int lit) -> bool {
-            int var = std::abs(lit);
-            int r = reason[var];
-            if (r < 0) return false;
-            for (int q : clauses[r]) {
-                int qv = std::abs(q);
-                if (qv == var) continue;
-                if (clause_vars.count(qv)) continue;
-                if (level[qv] == 0) continue;
-                auto it = cache.find(qv);
-                if (it != cache.end()) {
-                    if (it->second) continue;
-                    return false;
-                }
-                if (reason[qv] >= 0 && redundant(q)) { cache[qv] = 1; continue; }
-                cache[qv] = 0;
+    // [S1.3] recursive minimization with stamp arrays (same logic as v0)
+    bool redundant(int lit) {
+        int var = std::abs(lit);
+        int r = reason[var];
+        if (r < 0) return false;
+        for (int q : clauses[r]) {
+            int qv = std::abs(q);
+            if (qv == var) continue;
+            if (in_clause_stamp[qv] == min_stamp) continue;
+            if (level[qv] == 0) continue;
+            if (cache_stamp[qv] == min_stamp) {
+                if (cache_val[qv]) continue;
                 return false;
             }
-            return true;
-        };
-
-        int asserting = learned.back();
-        std::vector<int> minimized;
-        for (size_t i = 0; i + 1 < learned.size(); ++i) {
-            int lit = learned[i];
-            if (reason[std::abs(lit)] < 0) minimized.push_back(lit);
-            else if (redundant(lit)) { /* drop */ }
-            else minimized.push_back(lit);
+            if (reason[qv] >= 0 && redundant(q)) {
+                cache_stamp[qv] = min_stamp; cache_val[qv] = 1; continue;
+            }
+            cache_stamp[qv] = min_stamp; cache_val[qv] = 0;
+            return false;
         }
-        minimized.push_back(asserting);     // asserting literal stays LAST
-        return minimized;
+        return true;
     }
 
-    // returns index of newly added learned clause
+    // Minimizes `learned` in place (asserting literal stays last).
+    void minimize_learned_clause(std::vector<int>& learned) {
+        if (learned.size() <= 1) return;
+        ++min_stamp;
+        for (int l : learned) in_clause_stamp[std::abs(l)] = min_stamp;
+        int asserting = learned.back();
+        size_t j = 0;
+        for (size_t i = 0; i + 1 < learned.size(); ++i) {
+            int lit = learned[i];
+            if (reason[std::abs(lit)] >= 0 && redundant(lit)) continue;  // drop
+            learned[j++] = lit;
+        }
+        learned[j++] = asserting;
+        learned.resize(j);
+    }
+
     int add_learned_clause(const std::vector<int>& clause) {
         clauses.push_back(clause);
         int ci = (int)clauses.size() - 1;
+        // [S1.6] watch invariant: asserting lit at [0], highest-level other at [1]
+        {
+            auto& c = clauses[ci];
+            if (c.size() >= 2) {
+                std::swap(c[0], c.back());
+                size_t best = 1;
+                for (size_t k = 2; k < c.size(); ++k)
+                    if (level[std::abs(c[k])] > level[std::abs(c[best])]) best = k;
+                std::swap(c[1], c[best]);
+            }
+        }
         active.push_back(1);
         watch1.push_back(-1);
         watch2.push_back(-1);
         clause_is_learned.push_back(1);
-        clause_activity.push_back(1.0);
+        clause_activity.push_back(cla_inc);        // [S1.4] counts as one fresh bump
         clause_lbd.push_back(compute_lbd(clause));
         learned_clause_indices.push_back(ci);
         num_learned++;
@@ -517,21 +543,18 @@ struct CDCLSolver {
     }
 
     void reduce_clause_database() {
-        std::unordered_set<int> locked;
-        for (int v = 0; v <= n; ++v) {
-            if (reason[v] >= 0) locked.insert(reason[v]);
-        }
+        locked_buf.assign(clauses.size(), 0);
+        for (int v = 1; v <= n; ++v)
+            if (value[v] != -1 && reason[v] >= 0) locked_buf[reason[v]] = 1;
+
         std::vector<int> candidates;
         for (int ci : learned_clause_indices) {
-            if (!active[ci]) continue;
             if ((int)clauses[ci].size() <= 2) continue;
             if (clause_lbd[ci] <= 2) continue;
-            if (locked.count(ci)) continue;
+            if (locked_buf[ci]) continue;
             candidates.push_back(ci);
         }
         if (candidates.size() < 10) return;
-        // Python: sort(key=(lbd, -activity), reverse=True), stable.
-        // a before b iff lbd[a]>lbd[b], or (==) activity[a]<activity[b].
         std::stable_sort(candidates.begin(), candidates.end(),
             [&](int a, int b) {
                 if (clause_lbd[a] != clause_lbd[b]) return clause_lbd[a] > clause_lbd[b];
@@ -539,13 +562,24 @@ struct CDCLSolver {
             });
         size_t delete_count = candidates.size() / 2;
         for (size_t i = 0; i < delete_count; ++i) {
-            active[candidates[i]] = 0;
+            int ci = candidates[i];
+            active[ci] = 0;
+            std::vector<int>().swap(clauses[ci]);  // [S1.5] free the literals
             num_deleted_clauses++;
         }
+        // [S1.5] purge dead clauses from every watch list ...
+        for (auto& wl : watchlist) {
+            size_t j = 0;
+            for (int ci : wl) if (active[ci]) wl[j++] = ci;
+            wl.resize(j);
+        }
+        // ... and from the learned-clause index
+        size_t j = 0;
+        for (int ci : learned_clause_indices) if (active[ci]) learned_clause_indices[j++] = ci;
+        learned_clause_indices.resize(j);
         num_clause_reductions++;
     }
 
-    // Main CDCL loop. returns true = SAT, false = UNSAT.
     int solve() {   // 1=SAT, 0=UNSAT, 2=UNKNOWN(budget)
         decision_level = 0;
         std::fill(value.begin(), value.end(), -1);
@@ -558,39 +592,37 @@ struct CDCLSolver {
         next_reduce = reduce_base;
 
         int conflict = initial_propagate();
+        std::vector<int> learned;                  // [S1.3] reused every conflict
 
         while (true) {
             if (conflict_budget > 0 && num_conflicts >= conflict_budget) return 2;
             if (conflict != -1) {
-                if (decision_level == 0) return false;
-                std::vector<int> learned;
-                int backtrack_level = analyze_conflict(conflict, learned);
+                if (decision_level == 0) return 0;
+                analyze_conflict(conflict, learned);
                 int old_len = (int)learned.size();
-                learned = minimize_learned_clause(learned);
+                minimize_learned_clause(learned);
                 num_clause_literals_removed += old_len - (int)learned.size();
-                backtrack_level = compute_backjump_level(learned);
+                int backtrack_level = compute_backjump_level(learned);
                 int learned_idx = add_learned_clause(learned);
 
                 backtrack(backtrack_level);
-                decision_level = backtrack_level;
 
                 auto st = check_clause(clauses[learned_idx]);
                 if (st.first == ST_UNSAT) { conflict = learned_idx; continue; }
-                std::vector<int> seeds;
+                prop_queue.clear();
                 if (st.first == ST_UNIT) {
                     assign_lit(st.second, learned_idx);
-                    seeds.push_back(std::abs(st.second));
+                    prop_queue.push_back(std::abs(st.second));
                 }
-                conflict = propagate(seeds);
+                conflict = propagate();
             } else {
-                if (num_assigned == n) return true;
+                if (num_assigned == n) return 1;
 
                 if ((num_conflicts - conflicts_at_last_restart) >= restart_base * luby(luby_index)) {
                     conflicts_at_last_restart = num_conflicts;
                     luby_index += 1;
                     num_restarts += 1;
                     backtrack(0);
-                    decision_level = 0;
                     conflict = -1;
                     continue;
                 }
@@ -601,21 +633,32 @@ struct CDCLSolver {
                 }
 
                 int lit = choose_literal_vsids();
-                if (lit == 0) return true;
-                int var = std::abs(lit);
+                if (lit == 0) return 1;
                 decision_level += 1;
                 num_decisions += 1;
                 assign_lit(lit, -1);
-                conflict = propagate(std::vector<int>{var});
+                prop_queue.clear();
+                prop_queue.push_back(std::abs(lit));
+                conflict = propagate();
             }
         }
+    }
+
+    // true iff the current assignment satisfies every clause in `orig`
+    bool verify(const std::vector<std::vector<int>>& orig) const {
+        for (const auto& c : orig) {
+            bool sat = false;
+            for (int lit : c) if (litValue(lit) == 1) { sat = true; break; }
+            if (!sat) return false;
+        }
+        return true;
     }
 };
 
 
 int main(int argc, char* argv[]) {
     if (argc != 2 && argc != 3) {
-        std::cout << "Usage: ./cdcl <benchmark_folder> [output_csv]\n";
+        std::cout << "Usage: ./cdcl_v1 <benchmark_folder> [output_csv]\n";
         return 1;
     }
     std::string folder = argv[1];
@@ -627,8 +670,7 @@ int main(int argc, char* argv[]) {
                "restarts,lits_minimized,reductions,deleted_clauses\n";
     }
 
-    // Gather .cnf files via POSIX dirent (portable, no -lstdc++fs dependency).
-    std::vector<std::string> files;   // full paths
+    std::vector<std::string> files;
     {
         DIR* d = opendir(folder.c_str());
         if (!d) { std::cout << "ERROR: cannot open folder " << folder << "\n"; return 1; }
@@ -650,7 +692,7 @@ int main(int argc, char* argv[]) {
 
     long long tot_dec = 0, tot_conf = 0, tot_prop = 0, tot_learn = 0;
     long long tot_restart = 0, tot_min = 0, tot_del = 0;
-    int sat = 0, unsat = 0, timeouts = 0;
+    int sat = 0, unsat = 0, timeouts = 0, bad_models = 0;
     long long budget = 0;
     { const char* e = std::getenv("CDCL_MAX_CONFLICTS"); if (e) budget = std::atoll(e); }
     double totalTime = 0, minTime = std::numeric_limits<double>::max(), maxTime = 0;
@@ -661,16 +703,17 @@ int main(int argc, char* argv[]) {
         std::stringstream ss; ss << in.rdbuf();
         std::vector<std::vector<int>> clauses;
         int num_vars = parseFile(ss.str(), clauses);
+        std::vector<std::vector<int>> original = clauses;   // for model check
 
         CDCLSolver solver(std::move(clauses), num_vars);
         solver.conflict_budget = budget;
-        std::cerr << "solving " << fname << " ..." << std::endl;
         auto t0 = std::chrono::high_resolution_clock::now();
         int result = solver.solve();
         auto t1 = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1e6;
 
         std::string verdict = (result == 1) ? "SATISFIABLE" : (result == 0) ? "UNSATISFIABLE" : "TIMEOUT";
+        if (result == 1 && !solver.verify(original)) { verdict = "BAD_MODEL"; bad_models++; }
         if (result == 1) sat++; else if (result == 0) unsat++; else timeouts++;
         totalTime += elapsed;
         minTime = std::min(minTime, elapsed);
@@ -680,7 +723,7 @@ int main(int argc, char* argv[]) {
         tot_restart += solver.num_restarts; tot_min += solver.num_clause_literals_removed;
         tot_del += solver.num_deleted_clauses;
 
-        std::cout << fname << "," << verdict << ","
+        std::cout << fname << "," << elapsed << "," << verdict << ","
                   << solver.num_decisions << "," << solver.num_conflicts << ","
                   << solver.num_propagations << "," << solver.num_learned << ","
                   << solver.num_restarts << "," << solver.num_clause_literals_removed << ","
@@ -691,6 +734,7 @@ int main(int argc, char* argv[]) {
                 << solver.num_propagations << "," << solver.num_learned << ","
                 << solver.num_restarts << "," << solver.num_clause_literals_removed << ","
                 << solver.num_clause_reductions << "," << solver.num_deleted_clauses << "\n";
+            csv.flush();
         }
     }
     if (writeCSV) csv.close();
@@ -709,6 +753,7 @@ int main(int argc, char* argv[]) {
     std::cout << "avg clauses deleted: " << (double)tot_del / nfiles << "\n\n";
     std::cout << "SAT count: " << sat << "\n";
     std::cout << "UNSAT count: " << unsat << "\n";
+    if (bad_models) std::cout << "BAD MODELS: " << bad_models << "\n";
     if (writeCSV) std::cout << "\nResults written to " << argv[2] << "\n";
     return 0;
 }
