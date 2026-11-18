@@ -1,27 +1,8 @@
-// cdcl_v1.cpp -- Stage 1: algorithmic fixes on top of cdcl.cpp (v0)
-// 
-//   [S1.1] VSIDS rescale is magnitude-triggered (increment > 1e100), not
-//          every 1250 bumps. The old schedule divided by 1e100 while the
-//          increment had only grown ~1e26, so activities underflowed to 0.
-//   [S1.2] Watch lists are a vector<vector<int>> indexed by literal code
-//          (2*v for +v, 2*v+1 for -v) instead of an unordered_map.
-//   [S1.3] No per-conflict heap allocations: seen/touched flags, LBD level
-//          marks, minimization marks and the propagation queue are reusable
-//          members. std::function / unordered_set / unordered_map removed.
-//   [S1.4] Clause activity is bumped by a growing cla_inc and decays each
-//          conflict (MiniSat style, decay 0.999), with rescale at 1e20.
-//   [S1.5] Clause-DB reduction physically frees deleted clauses, removes
-//          them from every watch list and from learned_clause_indices.
-//   [S1.6] Learned clauses are watched correctly: the asserting literal is
-//          moved to position 0 and the highest-level other literal to
-//          position 1 before watching. v0 stored the asserting literal LAST
-//          but watched positions 0 and 1, i.e. two FALSE literals, so the
-//          clause often missed later propagations/conflicts (still sound,
-//          because original clauses are watched correctly, but much weaker).
-//
-// Search behaviour (decisions, restarts, learning, minimization, reduction
-// policy) is otherwise unchanged from v0.
-//
+// C++ implementation of the cdcl.py with some functionality changes. 
+// Translated By Claude, changed watchlist implementation from using unordered_map to using a vector of vectors, 
+// and added scratch buffers to avoid repeated allocations. 
+// Also added LBD-based clause database reduction and VSIDS variable selection.
+
 // Build:  g++ -std=c++17 -O2 -o cdcl_v1 cdcl_v1.cpp
 // Run:    ./cdcl_v1 <benchmark_folder> [output_csv]
 //         env CDCL_MAX_CONFLICTS=N gives up on an instance after N conflicts
@@ -107,7 +88,7 @@ struct CDCLSolver {
     std::vector<char> active;
     std::vector<int> watch1;
     std::vector<int> watch2;
-    std::vector<std::vector<int>> watchlist;   // [S1.2] indexed by lidx(lit)
+    std::vector<std::vector<int>> watchlist;   // indexed by lidx(lit)
 
     // clause metadata for LBD reduction
     std::vector<char> clause_is_learned;
@@ -269,7 +250,7 @@ struct CDCLSolver {
             num_propagations++;
             int false_lit = (val == 1) ? -var : var;
 
-            std::vector<int>& vec = watchlist[lidx(false_lit)];   // [S1.2]
+            std::vector<int>& vec = watchlist[lidx(false_lit)]; 
             size_t i = 0, j = 0, sz = vec.size();
             while (i < sz) {
                 int ci = vec[i];
@@ -564,7 +545,7 @@ struct CDCLSolver {
         for (size_t i = 0; i < delete_count; ++i) {
             int ci = candidates[i];
             active[ci] = 0;
-            std::vector<int>().swap(clauses[ci]);  // [S1.5] free the literals
+            std::vector<int>().swap(clauses[ci]);  // free the literals
             num_deleted_clauses++;
         }
         // [S1.5] purge dead clauses from every watch list ...
